@@ -1,24 +1,19 @@
 /*
- * 06_car_sta_hotspot - робот подключается к точке доступа ТЕЛЕФОНА.
+ * 06_car_sta_hotspot - робот подключается к существующей Wi-Fi сети.
+ *
+ * РЕДАКТИРОВАТЬ КОД НЕ НУЖНО. При старте скетч показывает список сетей
+ * в Serial Monitor, вы вводите номер и пароль прямо в строку ввода сверху
+ * и жмёте Send. Например:   3 moyparol123
  *
  * Зачем это нужно:
- *   1. ДИАГНОСТИКА. Чтобы подключиться к чужой сети, плата обязана ПЕРЕДАВАТЬ.
- *      Если подключение проходит - передатчик исправен, и проблема именно
- *      в режиме точки доступа. Если не проходит, хотя сеть видна в скане, -
- *      передатчик не работает, и это железо.
- *   2. РЕШЕНИЕ. Если сработает - этим можно пользоваться как есть, в том числе
- *      на показе в школе: телефон раздаёт сеть, робот в неё подключается,
- *      управление открывается по IP, который напечатан в Serial Monitor.
- *      Интернет для этого не нужен.
+ *   1. ДИАГНОСТИКА. Подключение к чужой сети физически требует ПЕРЕДАЧИ.
+ *      Прошло - передатчик исправен, сломан только режим точки доступа.
+ *      Не прошло, хотя сеть видна в списке, - передатчик мёртв, это железо.
+ *   2. РЕШЕНИЕ. Если сработает, этим можно пользоваться как есть: робот
+ *      живёт в домашней сети или в хотспоте телефона, пульт открывается
+ *      по IP, который напечатается в Serial Monitor. Интернет не нужен.
  *
- * ================  НАСТРОЙКА ТОЧКИ ДОСТУПА НА ТЕЛЕФОНЕ  ================
- * Android: Settings -> Network & internet -> Hotspot & tethering
- *          -> Wi-Fi hotspot
- *   - Hotspot name:  Phone
- *   - Password:      test1234
- *   - AP Band:       2.4 GHz  <<< ОБЯЗАТЕЛЬНО, ESP32 не видит 5 GHz
- *   - Мобильные данные можно не включать, интернет не нужен.
- * =======================================================================
+ * В Serial Monitor снизу справа: 115200 baud, слева от него - "Newline".
  */
 
 #include <WiFi.h>
@@ -32,9 +27,10 @@
   #include "img_converters.h"
 #endif
 
-// <<< ИМЯ И ПАРОЛЬ ТОЧКИ ДОСТУПА ТЕЛЕФОНА >>>
-const char *STA_SSID = "Phone";
-const char *STA_PASS = "test1234";
+// Выбираются в Serial Monitor при старте, править здесь не нужно.
+String g_ssid = "";
+String g_pass = "";
+#define MAX_NETS 40
 
 // --------------------------------------------------------------- пины моторов
 #define PIN_L_IN1   12
@@ -138,7 +134,31 @@ static const char *statusText(wl_status_t s) {
   }
 }
 
-static bool connectWiFi(uint32_t timeoutMs) {
+// Ждём строку из Serial Monitor. Пустые строки игнорируем.
+static String readLineBlocking() {
+  String s = "";
+  uint32_t hint = millis();
+  while (true) {
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n' || c == '\r') {
+        if (s.length() > 0) { Serial.println(); return s; }
+      } else {
+        s += c;
+        Serial.print(c);          // эхо, чтобы было видно, что набирается
+      }
+    }
+    if (millis() - hint > 15000) {
+      hint = millis();
+      Serial.println();
+      Serial.println("zhdu vvod v stroku sverhu: <nomer> <probel> <parol>, potom Send");
+    }
+    delay(20);
+  }
+}
+
+// Показываем список сетей и спрашиваем, к какой подключаться.
+static void chooseNetwork() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
@@ -146,25 +166,70 @@ static bool connectWiFi(uint32_t timeoutMs) {
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
 
-  // Сначала проверяем, видна ли вообще сеть телефона.
-  int n = WiFi.scanNetworks();
-  bool found = false;
-  int  rssi  = 0;
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == STA_SSID) { found = true; rssi = WiFi.RSSI(i); }
+  String ssids[MAX_NETS];
+  int    rssis[MAX_NETS];
+  int    count = 0;
+
+  Serial.println("skaniruyu efir...");
+  int n = WiFi.scanNetworks();          // результат уже отсортирован по RSSI
+
+  for (int i = 0; i < n && count < MAX_NETS; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() == 0) continue;
+    bool dup = false;
+    for (int j = 0; j < count; j++) if (ssids[j] == s) { dup = true; break; }
+    if (dup) continue;
+    ssids[count] = s;
+    rssis[count] = WiFi.RSSI(i);
+    count++;
   }
   WiFi.scanDelete();
-  Serial.printf("set \"%s\" v efire: %s", STA_SSID, found ? "DA" : "NET");
-  if (found) Serial.printf(", RSSI %d dBm", rssi);
-  Serial.println();
 
-  if (!found) {
-    Serial.println(">>> vklyuchi hotspot na telefone, AP Band = 2.4 GHz <<<");
-    return false;
+  if (count == 0) {
+    Serial.println("setey ne naydeno voobshe - eto uzhe problema priyoma");
+    return;
   }
 
-  Serial.printf("podklyuchayus k \"%s\" ...\n", STA_SSID);
-  WiFi.begin(STA_SSID, STA_PASS);
+  Serial.println();
+  Serial.println("=========== SETI VOKRUG ===========");
+  for (int i = 0; i < count; i++) {
+    Serial.printf("%2d | %4d dBm | %s\n", i + 1, rssis[i], ssids[i].c_str());
+  }
+  Serial.println("===================================");
+  Serial.println("Vvedi NOMER seti, probel, i PAROL. Primer:  3 moyparol123");
+  Serial.println("Potom nazhmi Send.");
+  Serial.print("> ");
+
+  while (true) {
+    String line = readLineBlocking();
+    line.trim();
+    int sp = line.indexOf(' ');
+    int idx = (sp > 0 ? line.substring(0, sp) : line).toInt();
+
+    if (idx < 1 || idx > count) {
+      Serial.printf("nuzhen nomer ot 1 do %d. Poprobuy esche raz.\n> ", count);
+      continue;
+    }
+    g_ssid = ssids[idx - 1];
+    g_pass = (sp > 0) ? line.substring(sp + 1) : "";
+    Serial.printf("vybrano: \"%s\", parol %d simvolov\n",
+                  g_ssid.c_str(), g_pass.length());
+    return;
+  }
+}
+
+static bool connectWiFi(uint32_t timeoutMs) {
+  if (g_ssid.length() == 0) return false;
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setSleep(false);
+
+  Serial.printf("podklyuchayus k \"%s\" ...\n", g_ssid.c_str());
+  WiFi.begin(g_ssid.c_str(), g_pass.c_str());
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
@@ -406,6 +471,8 @@ void setup() {
   cameraInit();
 #endif
 
+  chooseNetwork();
+
   if (connectWiFi(25000)) {
     Serial.println();
     Serial.println("*** TX RABOTAET - podklyuchenie proshlo ***");
@@ -419,8 +486,9 @@ void setup() {
   } else {
     Serial.println();
     Serial.printf("*** NE PODKLYUCHILOS, status %s ***\n", statusText(WiFi.status()));
-    Serial.println("Esli set byla vidna v skane, a podklyuchenie ne proshlo -");
-    Serial.println("peredatchik ne rabotaet. Eto zhelezo, ne nastroyki.");
+    Serial.println("Set byla v spiske, a podklyuchitsya ne poluchilos.");
+    Serial.println("Znachit peredatchik ne rabotaet. Eto zhelezo, ne nastroyki.");
+    Serial.println("Esli oshibka 4 CONNECT_FAILED - sverte parol i poprobuyte snova.");
   }
   g_lastCmd = millis();
 }
