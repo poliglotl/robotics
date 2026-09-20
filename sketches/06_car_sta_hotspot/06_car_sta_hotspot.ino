@@ -1,19 +1,27 @@
+// ======================================================================
+//   ВПИШИТЕ СЮДА СВОЙ ДОМАШНИЙ WI-FI, БОЛЬШЕ НИЧЕГО МЕНЯТЬ НЕ НУЖНО.
+//   Имя сети должно совпадать буква в букву (регистр, дефисы, пробелы).
+//   Сеть обязательно 2,4 ГГц - 5 ГГц ESP32 не видит в принципе.
+// ======================================================================
+
+const char *MY_SSID = "ИМЯ_ВАШЕЙ_СЕТИ";
+const char *MY_PASS = "ПАРОЛЬ_ОТ_НЕЁ";
+
+// ======================================================================
+
 /*
  * 06_car_sta_hotspot - робот подключается к существующей Wi-Fi сети.
- *
- * РЕДАКТИРОВАТЬ КОД НЕ НУЖНО. При старте скетч показывает список сетей
- * в Serial Monitor, вы вводите номер и пароль прямо в строку ввода сверху
- * и жмёте Send. Например:   3 moyparol123
  *
  * Зачем это нужно:
  *   1. ДИАГНОСТИКА. Подключение к чужой сети физически требует ПЕРЕДАЧИ.
  *      Прошло - передатчик исправен, сломан только режим точки доступа.
  *      Не прошло, хотя сеть видна в списке, - передатчик мёртв, это железо.
  *   2. РЕШЕНИЕ. Если сработает, этим можно пользоваться как есть: робот
- *      живёт в домашней сети или в хотспоте телефона, пульт открывается
- *      по IP, который напечатается в Serial Monitor. Интернет не нужен.
+ *      живёт в домашней сети, пульт открывается по IP, который напечатается
+ *      в Serial Monitor. Интернет для этого не нужен.
  *
- * В Serial Monitor снизу справа: 115200 baud, слева от него - "Newline".
+ * Устройство, с которого управляете, должно быть в ТОЙ ЖЕ сети.
+ * Serial Monitor: 115200 baud.
  */
 
 #include <WiFi.h>
@@ -27,10 +35,6 @@
   #include "img_converters.h"
 #endif
 
-// Выбираются в Serial Monitor при старте, править здесь не нужно.
-String g_ssid = "";
-String g_pass = "";
-#define MAX_NETS 40
 
 // --------------------------------------------------------------- пины моторов
 #define PIN_L_IN1   12
@@ -134,31 +138,8 @@ static const char *statusText(wl_status_t s) {
   }
 }
 
-// Ждём строку из Serial Monitor. Пустые строки игнорируем.
-static String readLineBlocking() {
-  String s = "";
-  uint32_t hint = millis();
-  while (true) {
-    while (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\n' || c == '\r') {
-        if (s.length() > 0) { Serial.println(); return s; }
-      } else {
-        s += c;
-        Serial.print(c);          // эхо, чтобы было видно, что набирается
-      }
-    }
-    if (millis() - hint > 15000) {
-      hint = millis();
-      Serial.println();
-      Serial.println("zhdu vvod v stroku sverhu: <nomer> <probel> <parol>, potom Send");
-    }
-    delay(20);
-  }
-}
-
-// Показываем список сетей и спрашиваем, к какой подключаться.
-static void chooseNetwork() {
+// Показываем, что плата видит в эфире, и есть ли среди этого нужная сеть.
+static void showNetworks() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
@@ -166,61 +147,32 @@ static void chooseNetwork() {
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
 
-  String ssids[MAX_NETS];
-  int    rssis[MAX_NETS];
-  int    count = 0;
-
   Serial.println("skaniruyu efir...");
-  int n = WiFi.scanNetworks();          // результат уже отсортирован по RSSI
+  int n = WiFi.scanNetworks();
 
-  for (int i = 0; i < n && count < MAX_NETS; i++) {
-    String s = WiFi.SSID(i);
-    if (s.length() == 0) continue;
-    bool dup = false;
-    for (int j = 0; j < count; j++) if (ssids[j] == s) { dup = true; break; }
-    if (dup) continue;
-    ssids[count] = s;
-    rssis[count] = WiFi.RSSI(i);
-    count++;
-  }
-  WiFi.scanDelete();
+  bool found = false;
+  int  rssi  = 0;
 
-  if (count == 0) {
-    Serial.println("setey ne naydeno voobshe - eto uzhe problema priyoma");
-    return;
-  }
-
-  Serial.println();
   Serial.println("=========== SETI VOKRUG ===========");
-  for (int i = 0; i < count; i++) {
-    Serial.printf("%2d | %4d dBm | %s\n", i + 1, rssis[i], ssids[i].c_str());
+  for (int i = 0; i < n && i < 40; i++) {
+    bool mine = (WiFi.SSID(i) == MY_SSID);
+    if (mine) { found = true; rssi = WiFi.RSSI(i); }
+    Serial.printf("%2d | %4d dBm | %s %s\n",
+                  i + 1, WiFi.RSSI(i), WiFi.SSID(i).c_str(),
+                  mine ? "<== VASHA SET" : "");
   }
   Serial.println("===================================");
-  Serial.println("Vvedi NOMER seti, probel, i PAROL. Primer:  3 moyparol123");
-  Serial.println("Potom nazhmi Send.");
-  Serial.print("> ");
+  WiFi.scanDelete();
 
-  while (true) {
-    String line = readLineBlocking();
-    line.trim();
-    int sp = line.indexOf(' ');
-    int idx = (sp > 0 ? line.substring(0, sp) : line).toInt();
-
-    if (idx < 1 || idx > count) {
-      Serial.printf("nuzhen nomer ot 1 do %d. Poprobuy esche raz.\n> ", count);
-      continue;
-    }
-    g_ssid = ssids[idx - 1];
-    g_pass = (sp > 0) ? line.substring(sp + 1) : "";
-    Serial.printf("vybrano: \"%s\", parol %d simvolov\n",
-                  g_ssid.c_str(), g_pass.length());
-    return;
+  if (found) {
+    Serial.printf("set \"%s\" naydena, RSSI %d dBm\n", MY_SSID, rssi);
+  } else {
+    Serial.printf("set \"%s\" NE naydena v spiske vyshe.\n", MY_SSID);
+    Serial.println("Sverte imya bukva v bukvu so spiskom i pereproshite.");
   }
 }
 
 static bool connectWiFi(uint32_t timeoutMs) {
-  if (g_ssid.length() == 0) return false;
-
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
@@ -228,8 +180,8 @@ static bool connectWiFi(uint32_t timeoutMs) {
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
 
-  Serial.printf("podklyuchayus k \"%s\" ...\n", g_ssid.c_str());
-  WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+  Serial.printf("podklyuchayus k \"%s\" ...\n", MY_SSID);
+  WiFi.begin(MY_SSID, MY_PASS);
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
@@ -471,7 +423,7 @@ void setup() {
   cameraInit();
 #endif
 
-  chooseNetwork();
+  showNetworks();
 
   if (connectWiFi(25000)) {
     Serial.println();
