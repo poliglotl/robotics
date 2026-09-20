@@ -447,7 +447,7 @@ void loop() {
   if (millis() - last > 5000) {
     last = millis();
     Serial.printf("[%6lu s] клиентов: %u | heap: %u | speed: %d\n",
-                  millis() / 1000, WiFi.softAPGetStationNum(),
+                  millis() / 1000, WiFi.softAPgetStationNum(),
                   ESP.getFreeHeap(), g_speed);
   }
 

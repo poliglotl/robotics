@@ -27,7 +27,7 @@ void handleRoot() {
                 "<title>AP test</title></head><body style='font-family:sans-serif'>"
                 "<h2>ESP32-CAM: точка доступа работает</h2>"
                 "<p>Uptime: " + String(millis() / 1000) + " c</p>"
-                "<p>Клиентов: " + String(WiFi.softAPGetStationNum()) + "</p>"
+                "<p>Клиентов: " + String(WiFi.softAPgetStationNum()) + "</p>"
                 "<p>Free heap: " + String(ESP.getFreeHeap()) + "</p>"
                 "</body></html>";
   server.send(200, "text/html", html);
@@ -70,7 +70,7 @@ void loop() {
     last = millis();
     Serial.printf("[%6lu s] клиентов: %u | heap: %u\n",
                   millis() / 1000,
-                  WiFi.softAPGetStationNum(),
+                  WiFi.softAPgetStationNum(),
                   ESP.getFreeHeap());
   }
 }
