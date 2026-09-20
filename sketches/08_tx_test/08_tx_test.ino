@@ -1,9 +1,10 @@
 #include <WiFi.h>
 
-// ===== ВПИШИТЕ СВОЙ ДОМАШНИЙ WI-FI, ТОЛЬКО 2.4 ГГц =====
-const char *MY_SSID = "MyHomeWiFi";
-const char *MY_PASS = "MyPassword";
-// =======================================================
+// ===== Оставьте пустым - скетч сам найдёт открытую сеть.        =====
+// ===== Или впишите своё имя сети и пароль, чтобы проверить её.  =====
+const char *MY_SSID = "";
+const char *MY_PASS = "";
+// ====================================================================
 
 const char *statusText(wl_status_t s) {
   switch (s) {
@@ -32,23 +33,36 @@ void setup() {
 
   Serial.println("skaniruyu efir...");
   int n = WiFi.scanNetworks();
-  bool found = false;
+
+  String target = MY_SSID;
+  String pass   = MY_PASS;
+  String bestOpen = "";
+  int    bestRssi = -127;
 
   for (int i = 0; i < n && i < 40; i++) {
-    bool mine = (WiFi.SSID(i) == MY_SSID);
-    if (mine) found = true;
-    Serial.printf("%2d | %4d dBm | %s %s\n", i + 1, WiFi.RSSI(i),
-                  WiFi.SSID(i).c_str(), mine ? "<== VASHA SET" : "");
+    bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+    Serial.printf("%2d | %4d dBm | %-8s | %s\n", i + 1, WiFi.RSSI(i),
+                  isOpen ? "OTKRYTA" : "s parolem", WiFi.SSID(i).c_str());
+    if (isOpen && WiFi.RSSI(i) > bestRssi) {
+      bestRssi = WiFi.RSSI(i);
+      bestOpen = WiFi.SSID(i);
+    }
   }
   WiFi.scanDelete();
 
-  if (!found) {
-    Serial.printf("set \"%s\" NE naydena. Sverte imya so spiskom vyshe.\n", MY_SSID);
-    return;
+  if (target.length() == 0) {
+    if (bestOpen.length() == 0) {
+      Serial.println("otkrytyh setey ne naydeno - vpishite svoyu set v MY_SSID");
+      return;
+    }
+    target = bestOpen;
+    pass   = "";
+    Serial.printf("avtovybor: samaya silnaya OTKRYTAYA set \"%s\", %d dBm\n",
+                  target.c_str(), bestRssi);
   }
 
-  Serial.printf("podklyuchayus k \"%s\"", MY_SSID);
-  WiFi.begin(MY_SSID, MY_PASS);
+  Serial.printf("podklyuchayus k \"%s\"", target.c_str());
+  WiFi.begin(target.c_str(), pass.c_str());
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 25000) {
@@ -64,7 +78,7 @@ void setup() {
     Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
   } else {
     Serial.printf("*** NE PODKLYUCHILOS, status %s ***\n", statusText(WiFi.status()));
-    Serial.println("Set vidna, a podklyuchitsya ne vyshlo - peredatchik ne rabotaet.");
+    Serial.println("Set otkrytaya, parolya net - znachit delo ne v parole.");
   }
 }
 
