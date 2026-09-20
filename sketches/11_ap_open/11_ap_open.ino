@@ -3,7 +3,7 @@
 // Точка доступа БЕЗ ПАРОЛЯ (открытая).
 // Проверяем гипотезу: всё, где участвует WPA2, не работает, а открытое - работает.
 
-const char *AP_SSID = "Car";
+const char *AP_SSID = "RobotCar";
 const int   AP_CHAN = 1;
 
 void setup() {
@@ -30,7 +30,7 @@ void setup() {
   Serial.printf("TX power: %d (78 = max)\n", (int)WiFi.getTxPower());
   Serial.printf("mode:     %d (2 = WIFI_AP)\n", (int)WiFi.getMode());
   Serial.println();
-  Serial.println("Ishchi set \"Car\" BEZ PAROLYA v WiFiman.");
+  Serial.println("Ishchi set \"RobotCar\" BEZ PAROLYA.");
 }
 
 void loop() {
