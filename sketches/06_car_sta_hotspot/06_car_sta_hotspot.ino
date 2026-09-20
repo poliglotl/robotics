@@ -37,10 +37,10 @@ const char *MY_PASS = "ПАРОЛЬ_ОТ_НЕЁ";
 
 
 // --------------------------------------------------------------- пины моторов
-#define PIN_L_IN1   12
-#define PIN_L_IN2   13
-#define PIN_R_IN1   14
-#define PIN_R_IN2   15
+#define PIN_L_IN1   13
+#define PIN_L_IN2   12
+#define PIN_R_IN1   15
+#define PIN_R_IN2   14
 #define PIN_FLASH_LED 4
 
 // --------------------------------------------------------------- пины камеры

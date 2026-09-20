@@ -46,10 +46,10 @@ int apChannel = 1;                  // выбирается автоматиче
 //
 // ВНИМАНИЕ: GPIO12 - strapping-пин. Если драйвер тянет его в HIGH на старте,
 // плата не загрузится. Ловишь циклический ребут - перенеси на GPIO2.
-#define PIN_L_IN1   12    // левая сторона, вперёд
-#define PIN_L_IN2   13    // левая сторона, назад
-#define PIN_R_IN1   14    // правая сторона, вперёд
-#define PIN_R_IN2   15    // правая сторона, назад
+#define PIN_L_IN1   13    // левая сторона, вперёд
+#define PIN_L_IN2   12    // левая сторона, назад
+#define PIN_R_IN1   15    // правая сторона, вперёд
+#define PIN_R_IN2   14    // правая сторона, назад
 
 #define PIN_FLASH_LED 4   // белый светодиод-фара на плате AI-Thinker
 
@@ -393,7 +393,7 @@ static bool cameraInit() {
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
     s->set_framesize(s, FRAMESIZE_QVGA);   // для езды важнее плавность
-    s->set_vflip(s, 0);                    // картинка вверх ногами -> поставь 1
+    s->set_vflip(s, 1);                    // на этом шасси камера перевёрнута
     s->set_hmirror(s, 0);
   }
   Serial.println("camera: OK");
