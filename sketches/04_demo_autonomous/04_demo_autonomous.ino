@@ -93,18 +93,18 @@ void setup() {
   PWM_SETUP(PIN_R_IN2, CH_R_IN2);
   drive(0, 0);
 
-  Serial.printf("старт через %d мс - поставьте робота на пол\n", START_DELAY_MS);
+  Serial.printf("start cherez %d ms - postavte robota na pol\n", START_DELAY_MS);
   blink(START_DELAY_MS / 400, 200);   // мигаем всё время ожидания
 
   for (int lap = 1; lap <= LAPS; lap++) {
-    Serial.printf("сторона %d/%d: вперёд\n", lap, LAPS);
+    Serial.printf("storona %d/%d: vperyod\n", lap, LAPS);
     drive(DRIVE_SPEED, DRIVE_SPEED);
     delay(DRIVE_MS);
 
     drive(0, 0);
     delay(PAUSE_MS);
 
-    Serial.printf("сторона %d/%d: поворот\n", lap, LAPS);
+    Serial.printf("storona %d/%d: povorot\n", lap, LAPS);
     drive(TURN_SPEED, -TURN_SPEED);   // разворот на месте вправо
     delay(TURN_MS);
 
@@ -113,7 +113,7 @@ void setup() {
   }
 
   drive(0, 0);
-  Serial.println("программа закончена. RESET для повтора.");
+  Serial.println("programma zakonchena. RESET dlya povtora.");
   blink(3, 300);
 }
 
