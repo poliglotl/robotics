@@ -52,6 +52,12 @@
 #define SERVO_FREQ 50
 #define SERVO_RES  16
 
+// Длительность импульса для 0 и 180 градусов.
+// 1000-2000 - безопасно для любого серво. 500-2500 - полный ход, но дешёвые
+// клоны SG90 упираются в механический стопор и начинают выть.
+#define PULSE_MIN_US 1000
+#define PULSE_MAX_US 2000
+
 // Пределы углов. Если серво упирается и начинает выть - сужай эти числа!
 #define PAN_MIN     45
 #define PAN_CENTER  90
@@ -94,7 +100,8 @@ static int tiltNow = TILT_CENTER;
 static uint32_t angleToDuty(int deg) {
   if (deg < 0)   deg = 0;
   if (deg > 180) deg = 180;
-  uint32_t us = 500 + (uint32_t)deg * 2000 / 180;
+  // Безопасный диапазон 1000-2000 мкс: дешёвые SG90 не упираются в стопоры.
+  uint32_t us = PULSE_MIN_US + (uint32_t)deg * (PULSE_MAX_US - PULSE_MIN_US) / 180;
   return (us * 65536UL) / 20000UL;
 }
 
