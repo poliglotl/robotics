@@ -1,45 +1,46 @@
 /*
- * 16_show_now - номер для показа. Wi-Fi нет, Serial нет.
+ * 16_show_now - номер для показа. Wi-Fi нет, Serial нет, серво нет.
+ * Эта версия отработала на школьном показе 25.09.
  *
- * ENABLE_SERVOS 0 - только колёса и фара. Заливай ЭТО.
- * ENABLE_SERVOS 1 - добавляет голову, если серво успели проверить.
+ * WIRING_SIDES 0 - моторы сгруппированы ПЕРЕДНИЕ / ЗАДНИЕ.
+ *                  Поворотов нет, номер едет по прямой.
+ * WIRING_SIDES 1 - моторы сгруппированы ЛЕВЫЕ / ПРАВЫЕ (после
+ *                  перестановки проводов на драйвере). Есть повороты.
  *
- * Серво (только при ENABLE_SERVOS 1):
- *   поворот  -> GPIO 2, наклон -> GPIO 1
- *   красные -> +5V красной платы, коричневые -> GND, батарейки включены
+ * Серво отключить физически: они воют и не двигаются, причина не найдена.
  *
- * Порядок: фара мигает 5 сек -> квадрат -> покачивание -> голова
- * осматривается -> три мигания. RESET для повтора.
+ * Порядок: фара мигает 5 сек -> номер -> три мигания. RESET для повтора.
  */
 
-#define ENABLE_SERVOS 0
+#define WIRING_SIDES 0
+
+// ---- ПРАВКА НАПРАВЛЕНИЯ. Меняй 0 на 1, если едет не туда.
+#define INVERT_A 0    // группа на пинах 13/12
+#define INVERT_B 0    // группа на пинах 15/14
 
 // ---- пины
-#define PIN_L_IN1 13
-#define PIN_L_IN2 12
-#define PIN_R_IN1 15
-#define PIN_R_IN2 14
-#define PIN_FLASH 4
-#define PIN_PAN    2
-#define PIN_TILT   1
+#define PIN_A_IN1 13
+#define PIN_A_IN2 12
+#define PIN_B_IN1 15
+#define PIN_B_IN2 14
+#define PIN_FLASH  4
 
 // ---- каналы
-#define CH_L1 2
-#define CH_L2 3
-#define CH_R1 4
-#define CH_R2 5
-#define CH_PAN  6
-#define CH_TILT 7
+#define CH_A1 2
+#define CH_A2 3
+#define CH_B1 4
+#define CH_B2 5
 
 #define MOTOR_FREQ 1000
 #define MOTOR_RES  8
 
 // ---- подстройка номера
-#define SPEED_FWD  170    // скорость вперёд 0..255
-#define SPEED_TURN 150    // скорость поворота
-#define DRIVE_MS   1200   // длина стороны квадрата, мс
-#define TURN_MS    650    // время поворота на 90 град, мс
-#define DANCE_TIMES 3     // сколько покачиваний
+#define SPEED_FWD   170   // скорость вперёд 0..255
+#define SPEED_TURN  180   // скорость поворота (только WIRING_SIDES 1)
+#define DRIVE_MS   1200   // длина проезда, мс
+#define TURN_MS    1300   // время поворота на 90 град, мс
+#define SHUFFLE_MS  220   // длина одного шага "шарканья"
+#define SHUFFLE_N     6   // сколько шагов
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   #define PWM_SETUP(pin, ch, freq, res) ledcAttach(pin, freq, res)
@@ -51,37 +52,45 @@
 #endif
 
 // ------------------------------------------------------------------ моторы
-// speed от -255 (назад) до 255 (вперёд)
-static void wheels(int left, int right) {
-  if (left > 255)  left = 255;
-  if (left < -255) left = -255;
-  if (right > 255)  right = 255;
-  if (right < -255) right = -255;
+// a, b от -255 (назад) до 255 (вперёд). Что такое a и b - зависит от
+// того, как провода воткнуты в драйвер: передние/задние или левые/правые.
+static void motors(int a, int b) {
+#if INVERT_A
+  a = -a;
+#endif
+#if INVERT_B
+  b = -b;
+#endif
 
-  if (left >= 0) {
-    PWM_WRITE(PIN_L_IN1, CH_L1, left);
-    PWM_WRITE(PIN_L_IN2, CH_L2, 0);
+  if (a > 255)  a = 255;
+  if (a < -255) a = -255;
+  if (b > 255)  b = 255;
+  if (b < -255) b = -255;
+
+  if (a >= 0) {
+    PWM_WRITE(PIN_A_IN1, CH_A1, a);
+    PWM_WRITE(PIN_A_IN2, CH_A2, 0);
   } else {
-    PWM_WRITE(PIN_L_IN1, CH_L1, 0);
-    PWM_WRITE(PIN_L_IN2, CH_L2, -left);
+    PWM_WRITE(PIN_A_IN1, CH_A1, 0);
+    PWM_WRITE(PIN_A_IN2, CH_A2, -a);
   }
 
-  if (right >= 0) {
-    PWM_WRITE(PIN_R_IN1, CH_R1, right);
-    PWM_WRITE(PIN_R_IN2, CH_R2, 0);
+  if (b >= 0) {
+    PWM_WRITE(PIN_B_IN1, CH_B1, b);
+    PWM_WRITE(PIN_B_IN2, CH_B2, 0);
   } else {
-    PWM_WRITE(PIN_R_IN1, CH_R1, 0);
-    PWM_WRITE(PIN_R_IN2, CH_R2, -right);
+    PWM_WRITE(PIN_B_IN1, CH_B1, 0);
+    PWM_WRITE(PIN_B_IN2, CH_B2, -b);
   }
 }
 
-static void stopWheels() { wheels(0, 0); }
+static void allStop() { motors(0, 0); }
 
 // Плавный разгон, чтобы робот не дёргался и не буксовал.
-static void ramp(int lFrom, int rFrom, int lTo, int rTo) {
+static void ramp(int aFrom, int bFrom, int aTo, int bTo) {
   for (int i = 1; i <= 12; i++) {
-    wheels(lFrom + (lTo - lFrom) * i / 12,
-           rFrom + (rTo - rFrom) * i / 12);
+    motors(aFrom + (aTo - aFrom) * i / 12,
+           bFrom + (bTo - bFrom) * i / 12);
     delay(8);
   }
 }
@@ -90,71 +99,15 @@ static void goFwd(int ms) {
   ramp(0, 0, SPEED_FWD, SPEED_FWD);
   delay(ms);
   ramp(SPEED_FWD, SPEED_FWD, 0, 0);
-  stopWheels();
+  allStop();
 }
 
-static void spinRight(int ms) {
-  ramp(0, 0, SPEED_TURN, -SPEED_TURN);
+static void goBack(int ms) {
+  ramp(0, 0, -SPEED_FWD, -SPEED_FWD);
   delay(ms);
-  ramp(SPEED_TURN, -SPEED_TURN, 0, 0);
-  stopWheels();
+  ramp(-SPEED_FWD, -SPEED_FWD, 0, 0);
+  allStop();
 }
-
-static void spinLeft(int ms) {
-  ramp(0, 0, -SPEED_TURN, SPEED_TURN);
-  delay(ms);
-  ramp(-SPEED_TURN, SPEED_TURN, 0, 0);
-  stopWheels();
-}
-
-// ------------------------------------------------------------------- серво
-#if ENABLE_SERVOS
-  #define SERVO_FREQ 50
-  #define SERVO_RES  16
-  #define PULSE_MIN_US 1000
-  #define PULSE_MAX_US 2000
-
-  // Узкие пределы: безопасно, даже если серво не успели проверить.
-  #define PAN_MIN     70
-  #define PAN_CENTER  90
-  #define PAN_MAX    110
-  #define TILT_MIN    80
-  #define TILT_CENTER 90
-  #define TILT_MAX   100
-  #define SERVO_STEP_MS 14
-
-  static int panNow  = PAN_CENTER;
-  static int tiltNow = TILT_CENTER;
-
-  static uint32_t angleToDuty(int deg) {
-    if (deg < 0)   deg = 0;
-    if (deg > 180) deg = 180;
-    uint32_t us = PULSE_MIN_US + (uint32_t)deg * (PULSE_MAX_US - PULSE_MIN_US) / 180;
-    return (us * 65536UL) / 20000UL;
-  }
-
-  static void panSmooth(int target) {
-    if (target < PAN_MIN) target = PAN_MIN;
-    if (target > PAN_MAX) target = PAN_MAX;
-    int step = (target > panNow) ? 1 : -1;
-    while (panNow != target) {
-      panNow += step;
-      PWM_WRITE(PIN_PAN, CH_PAN, angleToDuty(panNow));
-      delay(SERVO_STEP_MS);
-    }
-  }
-
-  static void tiltSmooth(int target) {
-    if (target < TILT_MIN) target = TILT_MIN;
-    if (target > TILT_MAX) target = TILT_MAX;
-    int step = (target > tiltNow) ? 1 : -1;
-    while (tiltNow != target) {
-      tiltNow += step;
-      PWM_WRITE(PIN_TILT, CH_TILT, angleToDuty(tiltNow));
-      delay(SERVO_STEP_MS);
-    }
-  }
-#endif
 
 // -------------------------------------------------------------------- фара
 static void blink(int times, int onMs, int offMs) {
@@ -167,85 +120,105 @@ static void blink(int times, int onMs, int offMs) {
 }
 
 // -------------------------------------------------------------------- акты
-static void actDriveLoop() {
+#if WIRING_SIDES
+
+// Провода стоят по бортам: группа A = левый борт, B = правый.
+static void spinRight(int ms) {
+  ramp(0, 0, SPEED_TURN, 0);
+  delay(ms);
+  ramp(SPEED_TURN, 0, 0, 0);
+  allStop();
+}
+
+static void spinLeft(int ms) {
+  ramp(0, 0, 0, SPEED_TURN);
+  delay(ms);
+  ramp(0, SPEED_TURN, 0, 0);
+  allStop();
+}
+
+static void actMain() {
+  // Квадрат из четырёх сторон.
   for (int side = 0; side < 4; side++) {
     goFwd(DRIVE_MS);
     delay(250);
     spinRight(TURN_MS);
     delay(250);
   }
-}
+  delay(400);
 
-static void actDance() {
-  for (int i = 0; i < DANCE_TIMES; i++) {
-    spinLeft(300);
+  // Покачивание влево-вправо.
+  for (int i = 0; i < 3; i++) {
+    spinLeft(450);
     delay(150);
-    spinRight(600);
+    spinRight(900);
     delay(150);
-    spinLeft(300);
+    spinLeft(450);
     delay(300);
   }
 }
 
-static void actLookAround() {
-#if ENABLE_SERVOS
-  panSmooth(PAN_MIN);
-  delay(500);
-  panSmooth(PAN_MAX);
-  delay(500);
-  panSmooth(PAN_CENTER);
-  delay(400);
-  tiltSmooth(TILT_MAX);
-  delay(500);
-  tiltSmooth(TILT_MIN);
-  delay(500);
-  tiltSmooth(TILT_CENTER);
-  delay(400);
 #else
-  // Серво нет - вместо головы короткий поклон: назад и вперёд.
-  ramp(0, 0, -SPEED_FWD, -SPEED_FWD);
-  delay(350);
-  ramp(-SPEED_FWD, -SPEED_FWD, 0, 0);
-  stopWheels();
-  delay(300);
-  goFwd(350);
-#endif
+
+// Провода стоят передние/задние: поворотов нет.
+// "Шарканье" - по очереди толкает передняя и задняя пара. Смотрится
+// как будто робот переступает с ноги на ногу.
+static void actShuffle() {
+  for (int i = 0; i < SHUFFLE_N; i++) {
+    motors(SPEED_FWD, 0);
+    digitalWrite(PIN_FLASH, HIGH);
+    delay(SHUFFLE_MS);
+    allStop();
+    digitalWrite(PIN_FLASH, LOW);
+    delay(120);
+
+    motors(0, SPEED_FWD);
+    delay(SHUFFLE_MS);
+    allStop();
+    delay(120);
+  }
 }
+
+static void actMain() {
+  goFwd(DRIVE_MS);          // выехал
+  delay(400);
+  goBack(DRIVE_MS / 2);     // откатился
+  delay(400);
+  actShuffle();             // переступил с ноги на ногу
+  delay(400);
+  goFwd(DRIVE_MS / 2);      // рывок вперёд
+  delay(300);
+  goBack(250);              // поклон: назад
+  delay(200);
+  goFwd(250);               // и вперёд
+  delay(300);
+  goBack(DRIVE_MS);         // уехал назад на место
+}
+
+#endif
 
 // ------------------------------------------------------------------- setup
 void setup() {
   pinMode(PIN_FLASH, OUTPUT);
   digitalWrite(PIN_FLASH, LOW);
 
-  PWM_SETUP(PIN_L_IN1, CH_L1, MOTOR_FREQ, MOTOR_RES);
-  PWM_SETUP(PIN_L_IN2, CH_L2, MOTOR_FREQ, MOTOR_RES);
-  PWM_SETUP(PIN_R_IN1, CH_R1, MOTOR_FREQ, MOTOR_RES);
-  PWM_SETUP(PIN_R_IN2, CH_R2, MOTOR_FREQ, MOTOR_RES);
-  stopWheels();
-
-#if ENABLE_SERVOS
-  PWM_SETUP(PIN_PAN,  CH_PAN,  SERVO_FREQ, SERVO_RES);
-  PWM_SETUP(PIN_TILT, CH_TILT, SERVO_FREQ, SERVO_RES);
-  PWM_WRITE(PIN_PAN,  CH_PAN,  angleToDuty(PAN_CENTER));
-  PWM_WRITE(PIN_TILT, CH_TILT, angleToDuty(TILT_CENTER));
-  delay(600);
-#endif
+  PWM_SETUP(PIN_A_IN1, CH_A1, MOTOR_FREQ, MOTOR_RES);
+  PWM_SETUP(PIN_A_IN2, CH_A2, MOTOR_FREQ, MOTOR_RES);
+  PWM_SETUP(PIN_B_IN1, CH_B1, MOTOR_FREQ, MOTOR_RES);
+  PWM_SETUP(PIN_B_IN2, CH_B2, MOTOR_FREQ, MOTOR_RES);
+  allStop();
 
   // 5 секунд на то, чтобы поставить робота на пол и отойти.
   blink(5, 200, 800);
 
-  actDriveLoop();
-  delay(400);
-  actDance();
-  delay(400);
-  actLookAround();
+  actMain();
 
-  stopWheels();
+  allStop();
   blink(3, 150, 150);
   digitalWrite(PIN_FLASH, LOW);
 }
 
 void loop() {
-  stopWheels();
+  allStop();
   delay(1000);
 }
