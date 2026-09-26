@@ -27,6 +27,11 @@
 // моторов на плате драйвера: перед+зад одного борта в одну пару выходов.
 #define WIRING_SIDES 0
 
+// Группа A - это выходы OUT1/OUT2, группа B - OUT3/OUT4 (или наоборот,
+// зависит от разводки платы-расширителя). Проверяется 19_wheel_sides.
+// Кнопки влево-вправо работают наоборот -> SWAP_SIDES 1.
+#define SWAP_SIDES 0
+
 // Группа едет не в ту сторону - поменяй её флаг на 1.
 #define INVERT_A 0
 #define INVERT_B 0
@@ -125,6 +130,15 @@ static void motors(int a, int b) {
   groupDrive(PIN_B_IN1, CH_B_IN1, PIN_B_IN2, CH_B_IN2, b);
 }
 
+// Борта. Какая группа какой борт - решает разводка, а не код.
+static void sides(int left, int right) {
+#if SWAP_SIDES
+  motors(right, left);
+#else
+  motors(left, right);
+#endif
+}
+
 static void allStop() { motors(0, 0); }
 
 static void motorsInit() {
@@ -210,18 +224,18 @@ static void applyCommand(const char *cmd) {
   int s = g_speed;
 
   if (!strcmp(cmd, "forward")) {
-    motors(s, s);
+    sides(s, s);
   } else if (!strcmp(cmd, "backward")) {
-    motors(-s, -s);
+    sides(-s, -s);
   } else if (!strcmp(cmd, "left")) {
 #if WIRING_SIDES
-    motors(0, s);          // правый борт толкает, левый стоит
+    sides(0, s);           // правый борт толкает, левый стоит
 #else
     Serial.println("povorot nevozmozhen: WIRING_SIDES 0");
 #endif
   } else if (!strcmp(cmd, "right")) {
 #if WIRING_SIDES
-    motors(s, 0);          // левый борт толкает, правый стоит
+    sides(s, 0);           // левый борт толкает, правый стоит
 #else
     Serial.println("povorot nevozmozhen: WIRING_SIDES 0");
 #endif
