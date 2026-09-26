@@ -16,10 +16,12 @@
 #define TEST_MOTORS 1     // 0 = не крутить моторы
 
 // пины (Keyestudio KS5024)
-#define PIN_L_IN1 13
-#define PIN_L_IN2 12
-#define PIN_R_IN1 15
-#define PIN_R_IN2 14
+// Драйвер даёт две группы выходов. Что они физически крутят - борта или
+// оси - зависит от того, как воткнуты провода. На нашем шасси это ОСИ.
+#define PIN_A_IN1 13
+#define PIN_A_IN2 12
+#define PIN_B_IN1 15
+#define PIN_B_IN2 14
 #define PIN_FLASH_LED 4
 
 #define PWDN_GPIO_NUM 32
@@ -157,7 +159,7 @@ static void testCamera() {
   esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
     Serial.printf("  esp_camera_init: oshibka 0x%x\n", err);
-    Serial.println("  0x105 = shleyf; 0x101 = pamyat; 0x103 = pины");
+    Serial.println("  0x105 = shleyf; 0x101 = pamyat; 0x103 = piny");
     record("Kamera", false, "init failed");
     return;
   }
@@ -193,14 +195,14 @@ static void testMotors() {
   return;
 #else
   Serial.println("  KOLYOSA DOLZHNY BYT VYVESHENY!");
-  PWM_SETUP(PIN_L_IN1, 2); PWM_SETUP(PIN_L_IN2, 3);
-  PWM_SETUP(PIN_R_IN1, 4); PWM_SETUP(PIN_R_IN2, 5);
+  PWM_SETUP(PIN_A_IN1, 2); PWM_SETUP(PIN_A_IN2, 3);
+  PWM_SETUP(PIN_B_IN1, 4); PWM_SETUP(PIN_B_IN2, 5);
 
   struct { int pin; int ch; const char *what; } steps[] = {
-    { PIN_L_IN1, 2, "LEVAYA vperyod" },
-    { PIN_L_IN2, 3, "LEVAYA nazad"   },
-    { PIN_R_IN1, 4, "PRAVAYA vperyod"},
-    { PIN_R_IN2, 5, "PRAVAYA nazad"  },
+    { PIN_A_IN1, 2, "GRUPPA A (13/12) vperyod" },
+    { PIN_A_IN2, 3, "GRUPPA A (13/12) nazad"   },
+    { PIN_B_IN1, 4, "GRUPPA B (15/14) vperyod" },
+    { PIN_B_IN2, 5, "GRUPPA B (15/14) nazad"   },
   };
 
   for (int i = 0; i < 4; i++) {
@@ -210,7 +212,7 @@ static void testMotors() {
     PWM_WRITE(steps[i].pin, steps[i].ch, 0);
     delay(400);
   }
-  record("Motory", true, "proverit glazami: 4 dvizheniya podryad");
+  record("Motory", true, "glazami: kakie kolyosa v kazhdoy gruppe");
 #endif
 }
 
