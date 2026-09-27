@@ -41,9 +41,9 @@
 //   FRAMESIZE_QVGA   320x240 - норма
 //   FRAMESIZE_HQVGA  240x176 - заметно шустрее
 //   FRAMESIZE_QQVGA  160x120 - почти без задержки, но мелко
-#define CAM_FRAME_SIZE FRAMESIZE_QVGA
-#define CAM_QUALITY    16    // 10 = красиво и тяжело, 25 = мыло и легко
-#define CAM_FRAME_GAP_MS 5   // пауза между кадрами: время Wi-Fi и пульту
+#define CAM_FRAME_SIZE FRAMESIZE_HQVGA
+#define CAM_QUALITY    14    // 10 = красиво и тяжело, 25 = мыло и легко
+#define CAM_FRAME_GAP_MS 2   // пауза между кадрами: время Wi-Fi и пульту
 
 // ------------------------------------------------------------ серво (голова)
 // GPIO2 свободен. Наклон на GPIO3 (RX): так живы логи в Serial Monitor,
@@ -350,6 +350,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <button id="fs">[ ] экран</button>
   <button id="led">фара</button>
   <button id="ctr">центр</button>
+  <button id="vid">видео</button>
   <span class="cap">скорость</span>
   <input type="range" id="sp" min="80" max="255" value="200">
   <span class="cap" id="spv">200</span>
@@ -456,12 +457,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   sp.oninput  = function(){ spv.textContent = sp.value; };
   sp.onchange = function(){ raw('speed=' + sp.value); };
 
-  // Стрим иногда обрывается. Поднимаем заново, но не чаще раза в секунду.
+  // Автоперезапуск стрима убран: он устраивал шторм переподключений -
+  // обрыв, onerror, новое соединение, оно вышибало предыдущее, и так по
+  // кругу, пока картинка не гасла совсем. Теперь только вручную кнопкой.
   var cam = document.getElementById('cam');
   function startStream(){
     cam.src = 'http://' + location.hostname + ':81/stream?t=' + Date.now();
   }
-  cam.onerror = function(){ setTimeout(startStream, 1000); };
+  document.getElementById('vid').onclick = startStream;
   startStream();
 </script></body></html>
 )HTML";
@@ -532,8 +535,20 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     esp_camera_fb_return(fb);              // возвращаем всегда, до выхода
 
     if (res != ESP_OK) break;              // клиент отключился
+
+    // Счётчик кадров: плавность видно цифрой, а не на глаз.
+    static uint32_t frames = 0, fpsAt = 0;
+    frames++;
+    if (millis() - fpsAt > 5000) {
+      Serial.printf("stream: %lu kadrov/sek\n",
+                    (unsigned long)(frames * 1000UL / (millis() - fpsAt)));
+      frames = 0;
+      fpsAt  = millis();
+    }
+
     vTaskDelay(pdMS_TO_TICKS(CAM_FRAME_GAP_MS));
   }
+  Serial.println("stream: klient otklyuchilsya");
   return res;
 }
 
@@ -588,14 +603,14 @@ static bool cameraInit() {
 #endif  // ENABLE_CAMERA
 
 static void startServers() {
-  // Пульт с приоритетом выше стрима: нажатия не ждут, пока уйдёт кадр.
+  // Приоритеты не трогаем. Попытка поднять пульт над стримом кончилась
+  // тем, что стрим стали вытеснять и видео пошло рывками.
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port      = 80;
   cfg.ctrl_port        = 32768;
   cfg.max_uri_handlers = 4;
   cfg.max_open_sockets = 4;
   cfg.lru_purge_enable = true;
-  cfg.task_priority    = tskIDLE_PRIORITY + 6;
 
   httpd_uri_t index_uri  = { "/",       HTTP_GET, index_handler,  NULL };
   httpd_uri_t action_uri = { "/action", HTTP_GET, action_handler, NULL };
@@ -609,15 +624,15 @@ static void startServers() {
   }
 
 #if ENABLE_CAMERA
-  // Стрим занимает рабочий поток целиком, поэтому он на отдельном порту,
-  // с приоритетом пониже и стеком побольше.
+  // Стрим занимает рабочий поток целиком, поэтому он на отдельном порту.
+  // Сокетов даём с запасом: при 2 браузер, переподключившись, вышибал
+  // сам себя и картинка гасла насовсем.
   httpd_config_t scfg = HTTPD_DEFAULT_CONFIG();
   scfg.server_port      = 81;
   scfg.ctrl_port        = 32769;
   scfg.max_uri_handlers = 1;
-  scfg.max_open_sockets = 2;
+  scfg.max_open_sockets = 4;
   scfg.lru_purge_enable = true;
-  scfg.task_priority    = tskIDLE_PRIORITY + 3;
   scfg.stack_size       = 8192;
 
   httpd_uri_t stream_uri = { "/stream", HTTP_GET, stream_handler, NULL };
@@ -702,5 +717,5 @@ void loop() {
                   ESP.getFreeHeap(), ESP.getMinFreeHeap(), g_speed);
   }
 
-  delay(5);   // серво шагает раз в 15 мс, так что loop должен быть бодрее
+  delay(10);  // серво шагает раз в 15 мс - чаще крутить loop смысла нет
 }
