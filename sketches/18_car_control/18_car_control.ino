@@ -37,6 +37,25 @@
 #define INVERT_A 0
 #define INVERT_B 0
 
+// ----------------------------------------------------------- настройка камеры
+// Картинка перевёрнута вверх ногами -> CAM_VFLIP 0.
+// Картинка зеркальная (текст читается наоборот) -> CAM_HMIRROR 1.
+#define CAM_VFLIP    0
+#define CAM_HMIRROR  0
+
+// Размер кадра. Меньше = меньше задержка.
+//   FRAMESIZE_QVGA   320x240 - норма для езды
+//   FRAMESIZE_HQVGA  240x176 - заметно шустрее
+//   FRAMESIZE_QQVGA  160x120 - почти без задержки, но мелко
+#define CAM_FRAME_SIZE FRAMESIZE_QVGA
+
+// Сжатие JPEG: 10 = красиво и тяжело, 25 = мыло и легко.
+// Задержка падает почти линейно с размером кадра.
+#define CAM_QUALITY  16
+
+// Пауза между кадрами. Меньше = плавнее, но Wi-Fi и пульту нужно время.
+#define CAM_FRAME_GAP_MS 2
+
 #if ENABLE_CAMERA
   #include "esp_camera.h"
   #include "img_converters.h"
@@ -420,7 +439,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (fb) esp_camera_fb_return(fb);
     if (res != ESP_OK) break;      // клиент отключился
 
-    vTaskDelay(pdMS_TO_TICKS(10)); // отдать время Wi-Fi и управлению
+    vTaskDelay(pdMS_TO_TICKS(CAM_FRAME_GAP_MS)); // время Wi-Fi и пульту
   }
   return res;
 }
@@ -445,16 +464,16 @@ static bool cameraInit() {
   c.pixel_format = PIXFORMAT_JPEG;
   c.grab_mode    = CAMERA_GRAB_LATEST;
 
+  // Буферы сразу под тот размер, который стримим. Раньше тут была VGA,
+  // которую потом уменьшали до QVGA - лишняя память и лишняя задержка.
+  c.frame_size   = CAM_FRAME_SIZE;
+  c.jpeg_quality = CAM_QUALITY;
   if (psramFound()) {
-    c.frame_size   = FRAMESIZE_VGA;
-    c.jpeg_quality = 12;
-    c.fb_count     = 2;
-    c.fb_location  = CAMERA_FB_IN_PSRAM;
+    c.fb_count    = 2;              // второй буфер + GRAB_LATEST = свежий кадр
+    c.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
-    c.frame_size   = FRAMESIZE_QVGA;
-    c.jpeg_quality = 14;
-    c.fb_count     = 1;
-    c.fb_location  = CAMERA_FB_IN_DRAM;
+    c.fb_count    = 1;
+    c.fb_location = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&c);
@@ -467,9 +486,10 @@ static bool cameraInit() {
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
     Serial.printf("sensor PID: 0x%x\n", s->id.PID);
-    s->set_framesize(s, FRAMESIZE_QVGA);   // для езды важнее плавность
-    s->set_vflip(s, 1);                    // на этом шасси камера перевёрнута
-    s->set_hmirror(s, 0);
+    s->set_framesize(s, CAM_FRAME_SIZE);
+    s->set_quality(s, CAM_QUALITY);
+    s->set_vflip(s, CAM_VFLIP);
+    s->set_hmirror(s, CAM_HMIRROR);
   }
   Serial.println("camera: OK");
   return true;
