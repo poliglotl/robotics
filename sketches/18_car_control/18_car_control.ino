@@ -56,6 +56,34 @@
 // Пауза между кадрами. Меньше = плавнее, но Wi-Fi и пульту нужно время.
 #define CAM_FRAME_GAP_MS 2
 
+// ------------------------------------------------------------ серво (голова)
+#define ENABLE_SERVOS 1
+
+// GPIO2 свободен. Наклон на GPIO3 (RX), а не на GPIO1 (TX): так остаются
+// живыми логи в Serial Monitor, а ввод в него нам всё равно не нужен.
+#define PIN_PAN   2       // поворот влево-вправо
+#define PIN_TILT  3       // наклон вверх-вниз
+#define CH_PAN    6       // каналы 6 и 7 = таймер 3, моторы его не трогают
+#define CH_TILT   7
+#define SERVO_FREQ 50
+#define SERVO_RES  16
+
+// Импульс для 0 и 180 градусов. 1000-2000 безопасно для любого серво,
+// 500-2500 это полный ход, но дешёвые SG90 упираются в стопор и воют.
+#define PULSE_MIN_US 1000
+#define PULSE_MAX_US 2000
+
+// Пределы углов. Серво упирается и начинает выть - сузить эти числа.
+#define PAN_MIN     60
+#define PAN_CENTER  90
+#define PAN_MAX    120
+#define TILT_MIN    70
+#define TILT_CENTER 90
+#define TILT_MAX   110
+
+// Скорость головы: один градус за столько миллисекунд, пока держишь кнопку.
+#define SERVO_STEP_MS 15
+
 #if ENABLE_CAMERA
   #include "esp_camera.h"
   #include "img_converters.h"
@@ -104,13 +132,14 @@ const int   AP_CHAN = 1;            // не подошёл - попробуй 6,
 
 // В ядре 3.x API LEDC сменился - поддерживаем обе версии.
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  #define PWM_SETUP(pin, ch)        ledcAttach((pin), PWM_FREQ, PWM_RES)
-  #define PWM_WRITE(pin, ch, duty)  ledcWrite((pin), (duty))
+  #define PWM_SETUP_F(pin, ch, freq, res) ledcAttach((pin), (freq), (res))
+  #define PWM_WRITE(pin, ch, duty)        ledcWrite((pin), (duty))
 #else
-  #define PWM_SETUP(pin, ch)        do { ledcSetup((ch), PWM_FREQ, PWM_RES); \
-                                         ledcAttachPin((pin), (ch)); } while (0)
-  #define PWM_WRITE(pin, ch, duty)  ledcWrite((ch), (duty))
+  #define PWM_SETUP_F(pin, ch, freq, res) do { ledcSetup((ch), (freq), (res)); \
+                                               ledcAttachPin((pin), (ch)); } while (0)
+  #define PWM_WRITE(pin, ch, duty)        ledcWrite((ch), (duty))
 #endif
+#define PWM_SETUP(pin, ch) PWM_SETUP_F((pin), (ch), PWM_FREQ, PWM_RES)
 
 // --------------------------------------------------------------- состояние
 static int      g_speed   = 200;    // 0..255
@@ -118,6 +147,14 @@ static uint32_t g_lastCmd = 0;
 static volatile bool g_showRequest = false;   // нажали кнопку "номер"
 static volatile bool g_showRunning = false;   // номер идёт, failsafe молчит
 static const uint32_t FAILSAFE_MS = 2000;
+
+#if ENABLE_SERVOS
+// Направление, пока кнопка зажата: -1, 0 или +1. Шагает в loop().
+static volatile int g_panDir  = 0;
+static volatile int g_tiltDir = 0;
+static int g_panNow  = PAN_CENTER;
+static int g_tiltNow = TILT_CENTER;
+#endif
 
 // ------------------------------------------------------------------ моторы
 static void groupDrive(int pinA, int chA, int pinB, int chB, int v) {
@@ -182,6 +219,55 @@ static void ramp(int aFrom, int bFrom, int aTo, int bTo) {
     delay(8);
   }
 }
+
+// ------------------------------------------------------------------- серво
+#if ENABLE_SERVOS
+static uint32_t angleToDuty(int deg) {
+  if (deg < 0)   deg = 0;
+  if (deg > 180) deg = 180;
+  uint32_t us = PULSE_MIN_US + (uint32_t)deg * (PULSE_MAX_US - PULSE_MIN_US) / 180;
+  return (us * 65536UL) / 20000UL;
+}
+
+static void servosInit() {
+  PWM_SETUP_F(PIN_PAN,  CH_PAN,  SERVO_FREQ, SERVO_RES);
+  PWM_SETUP_F(PIN_TILT, CH_TILT, SERVO_FREQ, SERVO_RES);
+  PWM_WRITE(PIN_PAN,  CH_PAN,  angleToDuty(g_panNow));
+  PWM_WRITE(PIN_TILT, CH_TILT, angleToDuty(g_tiltNow));
+  Serial.println("servos: init OK");
+}
+
+// Двигает голову на один градус в заданную сторону. Вызывается из loop()
+// по таймеру, пока кнопка зажата - получается плавное непрерывное движение.
+static void servoTick() {
+  static uint32_t last = 0;
+  if (millis() - last < SERVO_STEP_MS) return;
+  last = millis();
+
+  if (g_panDir) {
+    int t = g_panNow + g_panDir;
+    if (t >= PAN_MIN && t <= PAN_MAX) {
+      g_panNow = t;
+      PWM_WRITE(PIN_PAN, CH_PAN, angleToDuty(g_panNow));
+    }
+  }
+  if (g_tiltDir) {
+    int t = g_tiltNow + g_tiltDir;
+    if (t >= TILT_MIN && t <= TILT_MAX) {
+      g_tiltNow = t;
+      PWM_WRITE(PIN_TILT, CH_TILT, angleToDuty(g_tiltNow));
+    }
+  }
+}
+
+static void headCenter() {
+  g_panDir = g_tiltDir = 0;
+  g_panNow  = PAN_CENTER;
+  g_tiltNow = TILT_CENTER;
+  PWM_WRITE(PIN_PAN,  CH_PAN,  angleToDuty(g_panNow));
+  PWM_WRITE(PIN_TILT, CH_TILT, angleToDuty(g_tiltNow));
+}
+#endif  // ENABLE_SERVOS
 
 // ------------------------------------------------------------- номер по кнопке
 // Крутится в loop(), а не в обработчике HTTP: иначе пульт бы завис на 20 секунд.
@@ -267,6 +353,22 @@ static void applyCommand(const char *cmd) {
     motors(0, s);          // только группа 15/14
   } else if (!strcmp(cmd, "show")) {
     g_showRequest = true;
+#if ENABLE_SERVOS
+  } else if (!strcmp(cmd, "pan_l")) {
+    g_panDir = -1;
+  } else if (!strcmp(cmd, "pan_r")) {
+    g_panDir = +1;
+  } else if (!strcmp(cmd, "pan_s")) {
+    g_panDir = 0;
+  } else if (!strcmp(cmd, "tilt_u")) {
+    g_tiltDir = +1;
+  } else if (!strcmp(cmd, "tilt_d")) {
+    g_tiltDir = -1;
+  } else if (!strcmp(cmd, "tilt_s")) {
+    g_tiltDir = 0;
+  } else if (!strcmp(cmd, "head_c")) {
+    headCenter();
+#endif
   } else if (!strcmp(cmd, "led_on")) {
     digitalWrite(PIN_FLASH_LED, HIGH);
   } else if (!strcmp(cmd, "led_off")) {
@@ -279,73 +381,148 @@ static void applyCommand(const char *cmd) {
 // ------------------------------------------------------------------ веб UI
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Car</title>
 <style>
-  body{margin:0;background:#15171c;color:#e6e8ee;font:16px/1.4 system-ui,sans-serif;
-       text-align:center;padding:12px;-webkit-user-select:none;user-select:none}
-  #cam{width:100%;max-width:480px;border-radius:10px;background:#000;aspect-ratio:4/3}
-  .pad{display:grid;grid-template-columns:repeat(3,84px);gap:10px;
-       justify-content:center;margin:18px auto}
-  button{height:78px;border:0;border-radius:12px;background:#2b3040;color:#e6e8ee;
-         font-size:26px;touch-action:manipulation}
-  button:active{background:#4a71f0}
-  .wide{grid-column:1/4;height:48px;font-size:16px}
-  .row{max-width:300px;margin:0 auto 12px;display:flex;gap:10px;align-items:center}
-  input[type=range]{flex:1}
-  .diag{max-width:300px;margin:14px auto 0;display:flex;gap:8px}
-  .diag button{height:42px;font-size:14px;flex:1;background:#232733}
-  #st{color:#8b93a7;font-size:13px;margin-top:10px}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;
+            color:#e6e8ee;font:15px/1.3 system-ui,sans-serif;
+            -webkit-user-select:none;user-select:none;touch-action:none}
+
+  /* видео на весь экран, под всеми кнопками */
+  #cam{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;
+       background:#000;z-index:0}
+
+  /* верхняя панель */
+  #bar{position:fixed;top:0;left:0;right:0;z-index:2;display:flex;
+       align-items:center;gap:8px;padding:8px 12px;
+       padding-top:calc(8px + env(safe-area-inset-top));
+       background:linear-gradient(#000c,#0000)}
+  #bar button{height:34px;padding:0 12px;border:0;border-radius:8px;
+              background:#ffffff26;color:#e6e8ee;font-size:13px}
+  #bar button:active{background:#4a71f0}
+  #sp{flex:1;max-width:160px}
+  #st{margin-left:auto;font-size:12px;color:#ffffff8c;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* два джойстика по нижним углам */
+  .pad{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));z-index:2;
+       display:grid;grid-template-columns:repeat(3,58px);
+       grid-template-rows:repeat(3,52px);gap:6px}
+  .pad.l{left:calc(14px + env(safe-area-inset-left))}
+  .pad.r{right:calc(14px + env(safe-area-inset-right))}
+  .pad button{border:0;border-radius:10px;background:#ffffff2e;
+              color:#fff;font-size:20px;backdrop-filter:blur(3px)}
+  .pad button:active{background:#4a71f0}
+  .pad .lab{grid-column:1/4;display:flex;align-items:center;
+            justify-content:center;font-size:11px;color:#ffffff8c;
+            letter-spacing:.06em}
+  .pad.r button{background:#ffffff1f}
+
+  /* на широком экране джойстики не нужны - там клавиатура */
+  @media (min-width:900px) and (pointer:fine){ .pad{opacity:.35} }
 </style></head><body>
-<img id="cam" alt="video off">
-<div class="pad">
-  <span></span><button data-go="forward">&#9650;</button><span></span>
-  <button data-go="left">&#9664;</button>
-  <button data-go="stop">&#9632;</button>
-  <button data-go="right">&#9654;</button>
-  <span></span><button data-go="backward">&#9660;</button><span></span>
-  <button class="wide" id="led">фара вкл/выкл</button>
+
+<img id="cam" alt="">
+
+<div id="bar">
+  <button id="fs">[ ] экран</button>
+  <button id="led">фара</button>
+  <button id="show">номер</button>
+  <button id="ctr">центр</button>
+  <input type="range" id="sp" min="80" max="255" value="200">
+  <span id="st">WASD - колёса, стрелки - голова</span>
 </div>
-<div class="row">скорость<input type="range" id="sp" min="80" max="255" value="200"><span id="spv">200</span></div>
-<div class="row"><button class="wide" id="show" style="height:44px;font-size:15px">показать номер</button></div>
-<div class="diag">
-  <button data-go="test_a">мотор A (13/12)</button>
-  <button data-go="test_b">мотор B (15/14)</button>
+
+<div class="pad l">
+  <div class="lab">КОЛЁСА</div>
+  <span></span><button data-hold="forward">&#9650;</button><span></span>
+  <button data-hold="left">&#9664;</button>
+  <button data-tap="stop">&#9632;</button>
+  <button data-hold="right">&#9654;</button>
+  <span></span><button data-hold="backward">&#9660;</button><span></span>
 </div>
-<div id="st">&nbsp;</div>
+
+<div class="pad r">
+  <div class="lab">ГОЛОВА</div>
+  <span></span><button data-hold="tilt_u" data-off="tilt_s">&#9650;</button><span></span>
+  <button data-hold="pan_l" data-off="pan_s">&#9664;</button>
+  <button data-tap="head_c">&#9678;</button>
+  <button data-hold="pan_r" data-off="pan_s">&#9654;</button>
+  <span></span><button data-hold="tilt_d" data-off="tilt_s">&#9660;</button><span></span>
+</div>
+
 <script>
   var st = document.getElementById('st');
   function send(q){
-    fetch('/action?' + q).then(function(){ st.textContent = q; })
-                         .catch(function(){ st.textContent = 'нет связи'; });
+    fetch('/action?' + q).catch(function(){ st.textContent = 'нет связи'; });
   }
-  document.querySelectorAll('button[data-go]').forEach(function(b){
-    var dir = b.dataset.go;
-    var press = function(e){ e.preventDefault(); send('go=' + dir); };
-    var release = function(e){ e.preventDefault(); if (dir !== 'stop') send('go=stop'); };
-    b.addEventListener('touchstart', press, {passive:false});
-    b.addEventListener('touchend', release);
-    b.addEventListener('mousedown', press);
-    b.addEventListener('mouseup', release);
-    b.addEventListener('mouseleave', release);
+
+  // Кнопка "держать": нажал - поехали, отпустил - стоп.
+  function bindHold(b){
+    var on  = b.dataset.hold;
+    var off = b.dataset.off || 'stop';
+    var down = function(e){ e.preventDefault(); send('go=' + on); };
+    var up   = function(e){ e.preventDefault(); send('go=' + off); };
+    b.addEventListener('touchstart', down, {passive:false});
+    b.addEventListener('touchend',   up);
+    b.addEventListener('touchcancel',up);
+    b.addEventListener('mousedown',  down);
+    b.addEventListener('mouseup',    up);
+    b.addEventListener('mouseleave', up);
+  }
+  document.querySelectorAll('button[data-hold]').forEach(bindHold);
+  document.querySelectorAll('button[data-tap]').forEach(function(b){
+    b.addEventListener('click', function(e){
+      e.preventDefault(); send('go=' + b.dataset.tap);
+    });
   });
+
+  // Клавиатура: WASD колёса, стрелки голова.
+  var KEY = {
+    KeyW:['forward','stop'],  KeyS:['backward','stop'],
+    KeyA:['left','stop'],     KeyD:['right','stop'],
+    ArrowUp:['tilt_u','tilt_s'],   ArrowDown:['tilt_d','tilt_s'],
+    ArrowLeft:['pan_l','pan_s'],   ArrowRight:['pan_r','pan_s']
+  };
+  var held = {};
+  document.addEventListener('keydown', function(e){
+    var k = KEY[e.code];
+    if (!k) return;
+    e.preventDefault();
+    if (held[e.code]) return;      // не спамим на автоповторе
+    held[e.code] = 1;
+    send('go=' + k[0]);
+  });
+  document.addEventListener('keyup', function(e){
+    var k = KEY[e.code];
+    if (!k) return;
+    e.preventDefault();
+    held[e.code] = 0;
+    send('go=' + k[1]);
+  });
+  // Ушли с вкладки с зажатой клавишей - на всякий случай стоп.
+  window.addEventListener('blur', function(){
+    held = {}; send('go=stop'); send('go=pan_s'); send('go=tilt_s');
+  });
+
+  document.getElementById('fs').onclick = function(){
+    var d = document.documentElement;
+    if (document.fullscreenElement) { document.exitFullscreen(); }
+    else if (d.requestFullscreen)   { d.requestFullscreen(); }
+    else if (d.webkitRequestFullscreen) { d.webkitRequestFullscreen(); }
+  };
+
   var ledOn = false;
   document.getElementById('led').onclick = function(){
     ledOn = !ledOn; send('go=' + (ledOn ? 'led_on' : 'led_off'));
   };
   document.getElementById('show').onclick = function(){ send('go=show'); };
+  document.getElementById('ctr').onclick  = function(){ send('go=head_c'); };
+
   var sp = document.getElementById('sp');
-  sp.oninput = function(){
-    document.getElementById('spv').textContent = sp.value;
-    send('speed=' + sp.value);
-  };
-  document.addEventListener('keydown', function(e){
-    var m = {ArrowUp:'forward', ArrowDown:'backward', ArrowLeft:'left', ArrowRight:'right'};
-    if (m[e.key]) { e.preventDefault(); send('go=' + m[e.key]); }
-  });
-  document.addEventListener('keyup', function(e){
-    if (e.key.indexOf('Arrow') === 0) send('go=stop');
-  });
+  sp.oninput = function(){ send('speed=' + sp.value); };
+
   document.getElementById('cam').src = 'http://' + location.hostname + ':81/stream';
 </script></body></html>
 )HTML";
@@ -548,6 +725,10 @@ void setup() {
   // Моторы инициализируем первыми, чтобы они не дёргались на старте.
   motorsInit();
 
+#if ENABLE_SERVOS
+  servosInit();
+#endif
+
 #if ENABLE_CAMERA
   if (!cameraInit()) {
     Serial.println("prodolzhayu bez kamery - upravlenie budet rabotat");
@@ -584,11 +765,18 @@ void loop() {
     Serial.println("show: done");
   }
 
-  // Failsafe: пульт отвалился - моторы стоп.
+#if ENABLE_SERVOS
+  servoTick();
+#endif
+
+  // Failsafe: пульт отвалился - моторы стоп, голова замирает.
   static bool stopped = false;
   if (!g_showRunning && millis() - g_lastCmd > FAILSAFE_MS) {
     if (!stopped) {
       allStop();
+#if ENABLE_SERVOS
+      g_panDir = g_tiltDir = 0;
+#endif
       stopped = true;
       Serial.println("failsafe: stop");
     }
