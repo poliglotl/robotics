@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include "esp_wifi.h"           // ширина канала, список клиентов
 #include "soc/soc.h"            // отключение детектора просадки питания
 #include "soc/rtc_cntl_reg.h"
 
@@ -28,6 +29,14 @@
 #define INVERT_A     0       // группа 13/12 едет не в ту сторону -> 1
 #define INVERT_B     0       // группа 15/14 едет не в ту сторону -> 1
 #define SPEED      200       // скорость моторов, 0..255
+
+// ------------------------------------------------------------------ Wi-Fi
+// Вокруг под 90 сетей, и канал 1 - самый забитый из всех. На забитом
+// канале каждый кадр отбивается и переотправляется: отсюда "стоп-стоп-
+// пачка кадров". Поэтому канал выбираем сами, по замеру эфира.
+#define AUTO_CHANNEL 1       // 0 = взять AP_CHAN как есть
+#define AP_CHAN      1       // запасной канал, если AUTO_CHANNEL 0
+#define WIDE_CHANNEL 1       // 1 = HT40, двойная ширина канала = вдвое быстрее
 
 // ----------------------------------------------------------------- камера
 #define CAM_VFLIP    0       // картинка вверх ногами -> 1
@@ -41,8 +50,8 @@
 //   FRAMESIZE_QQVGA  160x120 - для гонок по коридору, смотреть не на что
 // Качество: МЕНЬШЕ число = лучше картинка и тяжелее кадр. 10 - хорошо,
 // 12-14 - компромисс, 18+ - мыло.
-#define CAM_FRAME_SIZE FRAMESIZE_VGA
-#define CAM_QUALITY   10
+#define CAM_FRAME_SIZE FRAMESIZE_QVGA
+#define CAM_QUALITY   12
 
 // ------------------------------------------------------------------ серво
 // Наклон на GPIO3 (RX): логи в Serial остаются живыми, ввод не нужен.
@@ -352,18 +361,61 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
   }
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  const size_t fb_len = fb->len;
   esp_err_t r = httpd_resp_send(req, (const char *)fb->buf, fb->len);
   esp_camera_fb_return(fb);                 // возвращаем всегда
 
+  // Кадров в секунду и уровень сигнала телефона. Если fps низкий, а
+  // сигнал слабый - виноват эфир. Если сигнал сильный, а fps низкий -
+  // виновата плата, и надо уменьшать кадр.
   static uint32_t frames = 0, at = 0;
   if (++frames >= 50) {
-    Serial.printf("video: %lu kadrov/sek\n",
-                  (unsigned long)(frames * 1000UL / (millis() - at)));
+    wifi_sta_list_t sta;
+    int rssi = 0;
+    if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) {
+      rssi = sta.sta[0].rssi;
+    }
+    Serial.printf("video: %lu kadr/sek, %u bayt, signal %d dBm\n",
+                  (unsigned long)(frames * 1000UL / (millis() - at)),
+                  (unsigned)fb_len, rssi);
     frames = 0;
     at = millis();
   }
   return r;
 }
+
+// Считаем "шум" каждого канала: чужая сеть мешает своим каналом сильно,
+// соседними - слабее. Вес по мощности, чтобы близкий роутер весил больше.
+#if AUTO_CHANNEL
+static int pickQuietestChannel() {
+  int n = WiFi.scanNetworks(false, false, false, 120);
+  if (n <= 0) {
+    Serial.println("wifi: skanirovanie pusto, kanal 1");
+    return 1;
+  }
+
+  long score[12] = {0};
+  for (int i = 0; i < n; i++) {
+    int ch = WiFi.channel(i);
+    if (ch < 1 || ch > 11) continue;
+    long w = WiFi.RSSI(i) + 100;          // -90 dBm -> 10, -30 dBm -> 70
+    if (w < 1) w = 1;
+    w = w * w;                            // ближний сосед мешает намного сильнее
+    for (int d = -2; d <= 2; d++) {
+      int c = ch + d;
+      if (c < 1 || c > 11) continue;
+      score[c] += (d == 0) ? w : w / 3;   // соседний канал мешает втрое слабее
+    }
+  }
+  WiFi.scanDelete();
+
+  int best = 1;
+  for (int c = 1; c <= 11; c++) if (score[c] < score[best]) best = c;
+  Serial.printf("wifi: setey %d, vybran kanal %d (shum %ld, na 1-m %ld)\n",
+                n, best, score[best], score[1]);
+  return best;
+}
+#endif
 
 static bool cameraInit() {
   camera_config_t c = {};
@@ -383,10 +435,13 @@ static bool cameraInit() {
   c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.grab_mode    = CAMERA_GRAB_LATEST;
+  // Один буфер и съёмка по запросу. С двумя буферами и GRAB_LATEST камера
+  // снимает непрерывно и постоянно жуёт шину PSRAM - ту самую, через
+  // которую идёт Wi-Fi. Нам кадр нужен ровно тогда, когда его просят.
+  c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   c.frame_size   = CAM_FRAME_SIZE;
   c.jpeg_quality = CAM_QUALITY;
-  c.fb_count     = psramFound() ? 2 : 1;
+  c.fb_count     = 1;
   c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
 
   if (esp_camera_init(&c) != ESP_OK) {
@@ -427,11 +482,28 @@ void setup() {
   servosInit();
 
   WiFi.persistent(false);
+
+  int chan = AP_CHAN;
+#if AUTO_CHANNEL
+  WiFi.mode(WIFI_STA);                      // сканировать можно только в STA
+  WiFi.disconnect(true);
+  delay(150);
+  chan = pickQuietestChannel();
+#endif
+
   WiFi.mode(WIFI_AP);
   delay(200);
-  WiFi.softAP("RobotCar", NULL, 1, 0, 2);   // без пароля, максимум 2 клиента
+  WiFi.softAP("RobotCar", NULL, chan, 0, 1);  // без пароля, один клиент
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.setSleep(false);                     // сон Wi-Fi = рывки
+  WiFi.setSleep(false);                       // сон Wi-Fi = рывки
+
+#if WIDE_CHANNEL
+  // HT40 - канал двойной ширины, вдвое больше пропускная способность.
+  // Если в эфире тесно и стало хуже - поставить WIDE_CHANNEL 0.
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT40);
+#endif
+
+  Serial.printf("wifi: kanal %d, %s\n", chan, WIDE_CHANNEL ? "HT40" : "HT20");
   Serial.print("pult: http://");
   Serial.println(WiFi.softAPIP());
 
