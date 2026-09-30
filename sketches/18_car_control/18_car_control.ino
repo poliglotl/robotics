@@ -53,6 +53,10 @@
 #define CAM_QUALITY   12
 
 // ------------------------------------------------------------------ серво
+// 0 = серво не трогаем совсем. Одно серво дохлое, второе воет, пока не
+// заменим - на показе пусть молчат. Кнопки головы просто ничего не делают.
+#define ENABLE_SERVOS 0
+
 // Наклон на GPIO3 (RX): логи в Serial остаются живыми, ввод не нужен.
 #define PIN_PAN   2
 #define PIN_TILT  3
@@ -145,6 +149,7 @@ static void sides(int l, int r) {
 }
 
 // ------------------------------------------------------------------ серво
+#if ENABLE_SERVOS
 static uint32_t angleToDuty(int deg) {
   deg = constrain(deg, 0, 180);
   uint32_t us = PULSE_MIN_US + (uint32_t)deg * (PULSE_MAX_US - PULSE_MIN_US) / 180;
@@ -198,6 +203,10 @@ static void servoTick() {
     if (t >= TILT_MIN && t <= TILT_MAX) servoWrite(PIN_TILT, CH_TILT, g_tiltNow = t);
   }
 }
+#else
+static void servosInit() { Serial.println("servos: OTKLYUCHENY"); }
+static void servoTick()  {}
+#endif
 
 // ---------------------------------------------------------------- команды
 // Коды короткие: меньше байт в запросе - меньше работы на каждое нажатие.
@@ -211,12 +220,14 @@ static void applyCommand(const char *c) {
     case 'l': sides(0, SPEED);       break;      // влево
     case 'r': sides(SPEED, 0);       break;      // вправо
 #endif
+#if ENABLE_SERVOS
     case 'L': g_panDir  = -1;        break;      // голова влево
     case 'R': g_panDir  = +1;        break;
     case 'P': g_panDir  =  0;        break;      // отпустили
     case 'U': g_tiltDir = +1;        break;      // голова вверх
     case 'D': g_tiltDir = -1;        break;
     case 'T': g_tiltDir =  0;        break;
+#endif
     case '1': digitalWrite(PIN_LED, HIGH); break;
     case '0': digitalWrite(PIN_LED, LOW);  break;
     default: break;
