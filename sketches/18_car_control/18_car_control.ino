@@ -400,7 +400,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   while (g_gen == myGen) {
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) { res = ESP_FAIL; break; }
+    if (!fb) {
+      Serial.println("video: esp_camera_fb_get() vernul NULL");
+      res = ESP_FAIL;
+      break;
+    }
 
     const size_t len = fb->len;
     const uint32_t t0 = millis();
@@ -426,6 +430,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       if (nq != q) { q = nq; if (sn) sn->set_quality(sn, q); }
       lastAdj = millis();
     }
+
+    vTaskDelay(1);                            // отдать время Wi-Fi и пульту
 
     if (++frames >= 50) {
       wifi_sta_list_t sta;
@@ -500,10 +506,15 @@ static bool cameraInit() {
   // Один буфер и съёмка по запросу. С двумя буферами и GRAB_LATEST камера
   // снимает непрерывно и постоянно жуёт шину PSRAM - ту самую, через
   // которую идёт Wi-Fi. Нам кадр нужен ровно тогда, когда его просят.
-  c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  // Для ПОТОКА нужны два буфера: пока один уходит в сеть, во второй
+  // снимается следующий кадр. С одним буфером и GRAB_WHEN_EMPTY (это
+  // было нужно, когда кадры запрашивали по одному) поток захлёбывается
+  // на первом же кадре - esp_camera_fb_get возвращает NULL, и браузер
+  // показывает битую картинку.
+  c.grab_mode    = CAMERA_GRAB_LATEST;
   c.frame_size   = CAM_FRAME_SIZE;
   c.jpeg_quality = CAM_QUALITY;
-  c.fb_count     = 1;
+  c.fb_count     = psramFound() ? 2 : 1;
   c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
 
   if (esp_camera_init(&c) != ESP_OK) {
