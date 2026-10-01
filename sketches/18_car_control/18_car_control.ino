@@ -10,9 +10,12 @@
  * Управление: WASD - колёса, стрелки - голова. На телефоне два джойстика
  * по нижним углам: слева колёса, справа голова. Кнопка [ ] - полный экран.
  *
- * Видео не поток, а по одному кадру: браузер просит следующий только когда
- * отрисовал предыдущий. Так кадры не копятся в буфере и картинка не идёт
- * рывками "стоп-стоп-стоп-пачка кадров".
+ * Видео - MJPEG-поток, как в заводской прошивке Keyestudio. Запрос кадра
+ * по одному стоил round-trip на каждый кадр: при пинге 100 мс больше
+ * 10 кадров/сек не выжать, сколько канала ни дай. Поток льёт непрерывно.
+ *
+ * Команды - на порту 81, своим сервером и своим потоком. У httpd один
+ * рабочий поток на сервер, а поток видео занимает его насовсем.
  */
 
 #include <WiFi.h>
@@ -269,6 +272,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <div id="bar">
   <button id="fs">[ ]</button>
   <button id="led">фара</button>
+  <button id="vid">видео</button>
 </div>
 
 <div class="pad l">
@@ -291,11 +295,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   // Команды идут на порт 81 - там свой поток, и они не ждут, пока
   // доедет кадр. Дубли не шлём.
   var CMD = 'http://' + location.hostname + ':81/a?c=';
-  var last = '', quietUntil = 0;
+  var last = '';
   function cmd(c){
     if (c === last) return;
     last = c;
-    quietUntil = Date.now() + 120;   // дать команде эфир, кадр подождёт
     fetch(CMD + c).catch(function(){});
   }
 
@@ -378,74 +381,70 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   return httpd_resp_send(req, NULL, 0);     // пустой ответ, нечего парсить
 }
 
-static esp_err_t jpg_handler(httpd_req_t *req) {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
-  }
-  httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  const size_t fb_len = fb->len;
+#define PART_BOUNDARY "frame"
+static const char *STREAM_TYPE =
+  "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *STREAM_HEAD =
+  "\r\n--" PART_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-  const uint32_t t0 = millis();
-  esp_err_t r = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-  const uint32_t sendMs = millis() - t0;
-  esp_camera_fb_return(fb);                 // возвращаем всегда
+// Новый клиент вытесняет предыдущего: после перезагрузки страницы иначе
+// два обработчика тянут кадры из одного буфера и оба идут рывками.
+static volatile uint32_t g_gen = 0;
 
-  // Сколько ушло на отправку кадра - честная мера того, как плох эфир.
-  // Долго - жмём сильнее, стало быстро - возвращаем качество. Правим не
-  // чаще двух раз в секунду, иначе картинка будет "дышать".
-  static int  g_q = CAM_QUALITY;
-  static bool g_small = false;          // true = ушли на мелкий кадр
-  static uint32_t lastAdj = 0;
-  if (millis() - lastAdj > 500) {
-    sensor_t *sn = esp_camera_sensor_get();
-    int q = g_q;
+static esp_err_t stream_handler(httpd_req_t *req) {
+  const uint32_t myGen = ++g_gen;
 
-    if (sendMs > 150) {
-      // Сначала жмём сильнее. Когда жать уже некуда - уменьшаем кадр.
-      if (q < CAM_QUALITY_MIN) q += 2;
-      else if (!g_small && sn) {
-        g_small = true;
-        sn->set_framesize(sn, FRAMESIZE_QQVGA);
-        Serial.println("video: efir ploh, ushli na QQVGA");
+  esp_err_t res = httpd_resp_set_type(req, STREAM_TYPE);
+  if (res != ESP_OK) return res;
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  int  q = CAM_QUALITY;
+  bool small = false;
+  uint32_t frames = 0, at = millis(), lastAdj = millis();
+  char head[96];
+
+  while (g_gen == myGen) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { res = ESP_FAIL; break; }
+
+    const size_t len = fb->len;
+    const uint32_t t0 = millis();
+    int hlen = snprintf(head, sizeof(head), STREAM_HEAD, (unsigned)len);
+    res = httpd_resp_send_chunk(req, head, hlen);
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, len);
+    const uint32_t sendMs = millis() - t0;
+    esp_camera_fb_return(fb);                 // возвращаем всегда
+    if (res != ESP_OK) break;                 // клиент ушёл
+
+    // Долго уходит кадр - значит эфир плох: жмём сильнее, а когда жать
+    // некуда - уменьшаем кадр. Освободился - возвращаем обратно.
+    if (millis() - lastAdj > 500) {
+      sensor_t *sn = esp_camera_sensor_get();
+      int nq = q;
+      if (sendMs > 150) {
+        if (nq < CAM_QUALITY_MIN) nq += 2;
+        else if (!small && sn) { small = true; sn->set_framesize(sn, FRAMESIZE_QQVGA); }
+      } else if (sendMs < 60) {
+        if (small && sn) { small = false; sn->set_framesize(sn, CAM_FRAME_SIZE); }
+        else if (nq > CAM_QUALITY) nq -= 1;
       }
-    } else if (sendMs < 60) {
-      // Эфир освободился: сначала вернуть размер, потом качество.
-      if (g_small && sn) {
-        g_small = false;
-        sn->set_framesize(sn, CAM_FRAME_SIZE);
-        Serial.println("video: efir svoboden, vernuli razmer");
-      } else if (q > CAM_QUALITY) {
-        q -= 1;
-      }
+      if (nq != q) { q = nq; if (sn) sn->set_quality(sn, q); }
+      lastAdj = millis();
     }
 
-    if (q != g_q) {
-      g_q = q;
-      if (sn) sn->set_quality(sn, g_q);
+    if (++frames >= 50) {
+      wifi_sta_list_t sta;
+      int rssi = 0;
+      if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) rssi = sta.sta[0].rssi;
+      Serial.printf("video: %lu kadr/sek, %u bayt, kachestvo %d, signal %d dBm\n",
+                    (unsigned long)(frames * 1000UL / (millis() - at)),
+                    (unsigned)len, q, rssi);
+      frames = 0;
+      at = millis();
     }
-    lastAdj = millis();
   }
-
-  // Кадров в секунду и уровень сигнала телефона. Если fps низкий, а
-  // сигнал слабый - виноват эфир. Если сигнал сильный, а fps низкий -
-  // виновата плата, и надо уменьшать кадр.
-  static uint32_t frames = 0, at = 0;
-  if (++frames >= 50) {
-    wifi_sta_list_t sta;
-    int rssi = 0;
-    if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) {
-      rssi = sta.sta[0].rssi;
-    }
-    Serial.printf("video: %lu kadr/sek, %u bayt, kachestvo %d, signal %d dBm\n",
-                  (unsigned long)(frames * 1000UL / (millis() - at)),
-                  (unsigned)fb_len, g_q, rssi);
-    frames = 0;
-    at = millis();
-  }
-  return r;
+  Serial.println("video: klient otklyuchilsya");
+  return res;
 }
 
 // Считаем "шум" каждого канала: чужая сеть мешает своим каналом сильно,
@@ -588,12 +587,12 @@ void setup() {
   cfg.lru_purge_enable = true;
   cfg.stack_size       = 8192;
 
-  httpd_uri_t page = { "/",    HTTP_GET, index_handler, NULL };
-  httpd_uri_t jpg  = { "/jpg", HTTP_GET, jpg_handler,   NULL };
+  httpd_uri_t page = { "/",       HTTP_GET, index_handler,  NULL };
+  httpd_uri_t strm = { "/stream", HTTP_GET, stream_handler, NULL };
 
   if (httpd_start(&server, &cfg) == ESP_OK) {
     httpd_register_uri_handler(server, &page);
-    httpd_register_uri_handler(server, &jpg);
+    httpd_register_uri_handler(server, &strm);
   } else {
     Serial.println("server 80 FAILED");
   }
