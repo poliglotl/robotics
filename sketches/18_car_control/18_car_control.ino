@@ -10,12 +10,19 @@
  * Управление: WASD - колёса, стрелки - голова. На телефоне два джойстика
  * по нижним углам: слева колёса, справа голова. Кнопка [ ] - полный экран.
  *
- * Видео - MJPEG-поток, как в заводской прошивке Keyestudio. Запрос кадра
- * по одному стоил round-trip на каждый кадр: при пинге 100 мс больше
- * 10 кадров/сек не выжать, сколько канала ни дай. Поток льёт непрерывно.
+ * ТРИ сервера, и это главное в этом файле. У esp_http_server ОДИН рабочий
+ * поток на сервер, а обработчик видео сидит в бесконечном цикле и держит
+ * его насовсем. Пока видео жило на порту 80 вместе со страницей, второй
+ * запрос /stream (перезагрузил страницу) ждал в очереди освобождения
+ * потока - и браузер показывал битую картинку, белый квадрат с иконкой.
+ *   порт 80  страница / и /jpg (один кадр, для проверки)
+ *   порт 81  команды /a?c=
+ *   порт 82  видеопоток /stream
  *
- * Команды - на порту 81, своим сервером и своим потоком. У httpd один
- * рабочий поток на сервер, а поток видео занимает его насовсем.
+ * ПРОВЕРКА, если картинки нет: открыть http://192.168.4.1/jpg
+ *   видно фотку        -> камера жива, дело в потоке
+ *   тот же белый квадрат -> камера не поднялась, смотреть camera: и psram:
+ *                           в Serial Monitor на 115200
  */
 
 #include <WiFi.h>
@@ -131,6 +138,7 @@ static uint32_t g_lastCmd = 0;
 static volatile int g_panDir = 0, g_tiltDir = 0;
 static int  g_panNow = PAN_CENTER, g_tiltNow = TILT_CENTER;
 static bool g_servosOk = false;
+static bool g_camOk    = false;
 
 // ----------------------------------------------------------------- моторы
 static void half(int pinA, int chA, int pinB, int chB, int v) {
@@ -346,21 +354,29 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     on = !on; cmd(on ? '1' : '0');
   };
 
-  // Поток MJPEG, как в заводской прошивке: одно соединение, кадры льются
-  // непрерывно. Запрос на каждый кадр стоил round-trip, и при плохом
-  // пинге это был потолок по кадрам. Кнопка "видео" поднимает поток,
-  // если он оборвался.
+  // Поток MJPEG на своём порту 82: одно соединение, кадры льются
+  // непрерывно. Порт отдельный потому, что обработчик потока занимает
+  // рабочий поток своего сервера насовсем - на порту 80 он не давал
+  // отдать ни страницу, ни второй запрос /stream.
+  // Повторов РОВНО ТРИ: лечит случай, когда картинку попросили раньше,
+  // чем поднялся сервер. Без ограничения это превращалось в шторм
+  // переподключений и чёрный экран насовсем.
   var cam = document.getElementById('cam');
+  var tries = 0;
   function startStream(){
-    cam.src = 'http://' + location.hostname + '/stream?t=' + Date.now();
+    cam.src = 'http://' + location.hostname + ':82/stream?t=' + Date.now();
   }
-  document.getElementById('vid').onclick = startStream;
+  cam.onerror = function(){
+    if (tries++ < 3) setTimeout(startStream, 2000);
+  };
+  document.getElementById('vid').onclick = function(){ tries = 0; startStream(); };
   startStream();
 </script></body></html>
 )HTML";
 
-static httpd_handle_t server = NULL;     // страница и кадры
+static httpd_handle_t websrv = NULL;     // страница и одиночный кадр
 static httpd_handle_t cmdsrv = NULL;     // только команды, свой поток
+static httpd_handle_t vidsrv = NULL;     // только поток, свой поток
 
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
@@ -376,6 +392,24 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   return httpd_resp_send(req, NULL, 0);     // пустой ответ, нечего парсить
 }
 
+// Один кадр одним запросом - только чтобы понять, камера виновата или сеть.
+// Открыть в браузере http://192.168.4.1/jpg
+static esp_err_t jpg_handler(httpd_req_t *req) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("jpg: esp_camera_fb_get() vernul NULL - kamera ne daet kadr");
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  const size_t len = fb->len;               // запомнить до возврата буфера
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, len);
+  esp_camera_fb_return(fb);
+  Serial.printf("jpg: otdan kadr %u bayt\n", (unsigned)len);
+  return res;
+}
+
 #define PART_BOUNDARY "frame"
 static const char *STREAM_TYPE =
   "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -388,6 +422,7 @@ static volatile uint32_t g_gen = 0;
 
 static esp_err_t stream_handler(httpd_req_t *req) {
   const uint32_t myGen = ++g_gen;
+  Serial.println("video: klient podklyuchilsya");
 
   esp_err_t res = httpd_resp_set_type(req, STREAM_TYPE);
   if (res != ESP_OK) return res;
@@ -504,18 +539,17 @@ static bool cameraInit() {
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
   // Для ПОТОКА нужны два буфера: пока один уходит в сеть, во второй
-  // снимается следующий кадр. С одним буфером и GRAB_WHEN_EMPTY (это
-  // было нужно, когда кадры запрашивали по одному) поток захлёбывается
-  // на первом же кадре - esp_camera_fb_get возвращает NULL, и браузер
-  // показывает битую картинку.
+  // снимается следующий кадр. Буферы живут в PSRAM - если её вдруг не
+  // нашли, лезем в обычную память и берём один, иначе не хватит места.
   c.grab_mode    = CAMERA_GRAB_LATEST;
   c.frame_size   = CAM_FRAME_SIZE;
   c.jpeg_quality = CAM_QUALITY;
   c.fb_count     = psramFound() ? 2 : 1;
   c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
 
-  if (esp_camera_init(&c) != ESP_OK) {
-    Serial.println("camera: init FAILED (shleyf, PSRAM, pitanie)");
+  esp_err_t err = esp_camera_init(&c);
+  if (err != ESP_OK) {
+    Serial.printf("camera: init FAILED, kod 0x%x (shleyf, PSRAM, pitanie)\n", err);
     return false;
   }
   sensor_t *s = esp_camera_sensor_get();
@@ -525,7 +559,17 @@ static bool cameraInit() {
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
   }
-  Serial.println("camera: OK");
+
+  // Пробный кадр прямо на старте: если камера не отдаёт кадр, это видно
+  // в Serial сразу, не дожидаясь браузера.
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (fb) {
+    Serial.printf("camera: OK, probnyy kadr %u bayt, buferov %d\n",
+                  (unsigned)fb->len, (int)c.fb_count);
+    esp_camera_fb_return(fb);
+  } else {
+    Serial.println("camera: init OK, no PROBNYY KADR NE POLUCHEN");
+  }
   return true;
 }
 
@@ -538,6 +582,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== car ===");
+  Serial.printf("psram: %s\n", psramFound() ? "est" : "NET - budet odin bufer!");
 
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
@@ -548,7 +593,7 @@ void setup() {
   pwmSetup(PIN_B_IN2, CH_B_IN2, 1000, 8);
   motors(0, 0);
 
-  cameraInit();
+  g_camOk = cameraInit();
   servosInit();
 
   WiFi.persistent(false);
@@ -574,28 +619,32 @@ void setup() {
 #endif
 
   Serial.printf("wifi: kanal %d, %s\n", chan, WIDE_CHANNEL ? "HT40" : "HT20");
-  Serial.print("pult: http://");
+  Serial.print("pult:  http://");
   Serial.println(WiFi.softAPIP());
+  Serial.print("kadr:  http://");
+  Serial.print(WiFi.softAPIP());
+  Serial.println("/jpg   <- esli net kartinki, otkryt eto");
 
-  // Два сервера, и это принципиально. У esp_http_server один рабочий
-  // поток на сервер: пока он отдаёт кадр, следующий запрос ждёт. Когда
-  // команды жили на том же сервере, каждое нажатие ждало конца кадра -
-  // на плохой связи это сотни миллисекунд, и управление "вязло".
-  // Теперь команды на своём порту со своим потоком и не ждут никого.
-  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.server_port      = 80;
-  cfg.ctrl_port        = 32768;
-  cfg.max_uri_handlers = 2;
-  cfg.max_open_sockets = 3;
-  cfg.lru_purge_enable = true;
-  cfg.stack_size       = 8192;
+  // ТРИ сервера, у каждого свой рабочий поток. У esp_http_server поток
+  // ровно один на сервер, а обработчик видео не выходит из своего цикла
+  // никогда. Поэтому видео нельзя держать вместе ни со страницей, ни с
+  // командами: оно их просто не пустит.
+  //   80 - страница и /jpg
+  //   81 - команды (нажатие не ждёт кадра)
+  //   82 - поток
+  httpd_config_t wcfg = HTTPD_DEFAULT_CONFIG();
+  wcfg.server_port      = 80;
+  wcfg.ctrl_port        = 32768;
+  wcfg.max_uri_handlers = 2;
+  wcfg.max_open_sockets = 3;
+  wcfg.lru_purge_enable = true;
+  wcfg.stack_size       = 8192;
 
-  httpd_uri_t page = { "/",       HTTP_GET, index_handler,  NULL };
-  httpd_uri_t strm = { "/stream", HTTP_GET, stream_handler, NULL };
-
-  if (httpd_start(&server, &cfg) == ESP_OK) {
-    httpd_register_uri_handler(server, &page);
-    httpd_register_uri_handler(server, &strm);
+  httpd_uri_t page = { "/",    HTTP_GET, index_handler, NULL };
+  httpd_uri_t shot = { "/jpg", HTTP_GET, jpg_handler,   NULL };
+  if (httpd_start(&websrv, &wcfg) == ESP_OK) {
+    httpd_register_uri_handler(websrv, &page);
+    httpd_register_uri_handler(websrv, &shot);
   } else {
     Serial.println("server 80 FAILED");
   }
@@ -613,6 +662,23 @@ void setup() {
   } else {
     Serial.println("server 81 FAILED");
   }
+
+  httpd_config_t vcfg = HTTPD_DEFAULT_CONFIG();
+  vcfg.server_port      = 82;
+  vcfg.ctrl_port        = 32770;
+  vcfg.max_uri_handlers = 1;
+  vcfg.max_open_sockets = 2;      // старое соединение вытесняется новым
+  vcfg.lru_purge_enable = true;
+  vcfg.stack_size       = 8192;
+
+  httpd_uri_t strm = { "/stream", HTTP_GET, stream_handler, NULL };
+  if (httpd_start(&vidsrv, &vcfg) == ESP_OK) {
+    httpd_register_uri_handler(vidsrv, &strm);
+  } else {
+    Serial.println("server 82 FAILED");
+  }
+
+  Serial.printf("pamyat: svobodno %u bayt\n", (unsigned)ESP.getFreeHeap());
   g_lastCmd = millis();
 }
 
