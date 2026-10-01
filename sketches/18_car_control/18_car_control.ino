@@ -346,21 +346,16 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     on = !on; cmd(on ? '1' : '0');
   };
 
-  // Кадр за кадром: следующий просим только когда предыдущий загрузился.
-  // Очередь кадров не копится, поэтому видно всегда самое свежее.
-  var cam = document.getElementById('cam'), n = 0;
-  function frame(){
-    // Только что нажали кнопку - пропускаем момент, чтобы команда ушла
-    // первой. Кадром позже можно пожертвовать, задержкой управления нет.
-    var wait = quietUntil - Date.now();
-    if (wait > 0) { setTimeout(frame, wait); return; }
-
-    var img = new Image();
-    img.onload  = function(){ cam.src = img.src; frame(); };
-    img.onerror = function(){ setTimeout(frame, 500); };
-    img.src = '/jpg?' + (n++);
+  // Поток MJPEG, как в заводской прошивке: одно соединение, кадры льются
+  // непрерывно. Запрос на каждый кадр стоил round-trip, и при плохом
+  // пинге это был потолок по кадрам. Кнопка "видео" поднимает поток,
+  // если он оборвался.
+  var cam = document.getElementById('cam');
+  function startStream(){
+    cam.src = 'http://' + location.hostname + '/stream?t=' + Date.now();
   }
-  frame();
+  document.getElementById('vid').onclick = startStream;
+  startStream();
 </script></body></html>
 )HTML";
 
