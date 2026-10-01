@@ -19,8 +19,14 @@
  *   порт 81  команды /a?c=
  *   порт 82  видеопоток /stream
  *
+ * Поток НЕ отдаётся в <img>. Движок WebKit (Safari и ВСЕ браузеры на
+ * iPhone, включая Chrome) не умеет multipart/x-mixed-replace в картинке:
+ * сервер льёт кадры, а показать их некому - отсюда битая картинка. Кадры
+ * разбираем сами в JS по маркерам JPEG и рисуем на canvas. Если чтение
+ * потока недоступно, страница сама падает на /jpg по кругу.
+ *
  * ПРОВЕРКА, если картинки нет: открыть http://192.168.4.1/jpg
- *   видно фотку        -> камера жива, дело в потоке
+ *   видно фотку        -> камера жива, дело в доставке
  *   тот же белый квадрат -> камера не поднялась, смотреть camera: и psram:
  *                           в Serial Monitor на 115200
  */
@@ -262,7 +268,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
             font:15px system-ui,sans-serif;user-select:none;
             -webkit-user-select:none;touch-action:none}
   #cam{position:fixed;inset:0;width:100%;height:100%;object-fit:contain}
-  #bar{position:fixed;top:0;left:0;z-index:2;display:flex;gap:8px;padding:8px}
+  #bar{position:fixed;top:0;left:0;z-index:2;display:flex;gap:8px;padding:8px;
+       align-items:center}
+  #msg{color:#ffd27f;font-size:12px}
   #bar button{height:32px;padding:0 12px;border:0;border-radius:8px;
               background:#ffffff26;color:#fff;font-size:13px}
   .pad{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));z-index:2;
@@ -275,12 +283,13 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .pad button:active,#bar button:active{background:#4a71f0}
 </style></head><body>
 
-<img id="cam" alt="">
+<canvas id="cam"></canvas>
 
 <div id="bar">
   <button id="fs">[ ]</button>
   <button id="led">фара</button>
   <button id="vid">видео</button>
+  <span id="msg"></span>
 </div>
 
 <div class="pad l">
@@ -354,23 +363,103 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     on = !on; cmd(on ? '1' : '0');
   };
 
-  // Поток MJPEG на своём порту 82: одно соединение, кадры льются
-  // непрерывно. Порт отдельный потому, что обработчик потока занимает
-  // рабочий поток своего сервера насовсем - на порту 80 он не давал
-  // отдать ни страницу, ни второй запрос /stream.
-  // Повторов РОВНО ТРИ: лечит случай, когда картинку попросили раньше,
-  // чем поднялся сервер. Без ограничения это превращалось в шторм
-  // переподключений и чёрный экран насовсем.
-  var cam = document.getElementById('cam');
-  var tries = 0;
-  function startStream(){
-    cam.src = 'http://' + location.hostname + ':82/stream?t=' + Date.now();
+  // ------------------------------------------------------------ видео
+  // Поток в <img> НЕ работает на WebKit - это Safari и все браузеры на
+  // iPhone. Сервер льёт кадры, браузер их не показывает, получается
+  // битая картинка. Поэтому читаем поток сами и рисуем на canvas:
+  // в байтах ищем JPEG - начинается с FF D8, кончается FF D9 - и каждый
+  // найденный кусок отправляем на отрисовку. Внутри JPEG байт FF всегда
+  // идёт в паре с 00 или с маркером, так что FF D9 раньше конца кадра
+  // не встретится.
+  var cv  = document.getElementById('cam');
+  var ctx = cv.getContext('2d');
+  var msg = document.getElementById('msg');
+  var STREAM = 'http://' + location.hostname + ':82/stream';
+  var busy = false, polling = false, shown = 0;
+
+  function say(t){ msg.textContent = t; }
+
+  function draw(bytes){
+    if (busy) return;                      // прошлый кадр ещё декодируется
+    busy = true;
+    createImageBitmap(new Blob([bytes], {type:'image/jpeg'})).then(function(b){
+      if (cv.width !== b.width) { cv.width = b.width; cv.height = b.height; }
+      ctx.drawImage(b, 0, 0);
+      b.close();
+      busy = false;
+      if (!shown++) say('');               // первый кадр - убрать надпись
+    }).catch(function(){ busy = false; });
   }
-  cam.onerror = function(){
-    if (tries++ < 3) setTimeout(startStream, 2000);
+
+  function find(a, b1, b2, from){
+    for (var i = from; i + 1 < a.length; i++)
+      if (a[i] === b1 && a[i + 1] === b2) return i;
+    return -1;
+  }
+
+  var buf = new Uint8Array(0);
+  function feed(chunk){
+    var n = new Uint8Array(buf.length + chunk.length);
+    n.set(buf); n.set(chunk, buf.length); buf = n;
+    for (;;) {
+      var s = find(buf, 0xFF, 0xD8, 0);
+      if (s < 0) {                         // начала кадра ещё не видно
+        buf = buf.slice(Math.max(0, buf.length - 1));
+        return;
+      }
+      var e = find(buf, 0xFF, 0xD9, s + 2);
+      if (e < 0) {                         // кадр ещё не доехал целиком
+        if (s) buf = buf.slice(s);
+        return;
+      }
+      draw(buf.slice(s, e + 2));
+      buf = buf.slice(e + 2);
+    }
+  }
+
+  function runStream(){
+    say('поток...');
+    buf = new Uint8Array(0);
+    fetch(STREAM + '?t=' + Date.now()).then(function(r){
+      if (!r.ok)   throw new Error('HTTP ' + r.status);
+      if (!r.body) throw new Error('чтение потока не поддерживается');
+      var rd = r.body.getReader();
+      (function pump(){
+        return rd.read().then(function(x){
+          if (x.done) throw new Error('поток закончился');
+          feed(x.value);
+          return pump();
+        });
+      })().catch(function(e){ fallback(e.message); });
+    }).catch(function(e){ fallback(e.message); });
+  }
+
+  // Запасной путь: кадры по одному. Медленнее - на каждый кадр уходит
+  // отдельный запрос - но работает везде, где вообще работает картинка.
+  function fallback(why){
+    if (polling) return;
+    polling = true;
+    say(why + ' -> кадры по одному');
+    poll();
+  }
+  function poll(){
+    fetch('/jpg?t=' + Date.now()).then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.arrayBuffer();
+    }).then(function(a){
+      draw(new Uint8Array(a));
+      setTimeout(poll, 60);
+    }).catch(function(e){
+      say('кадр: ' + e.message);
+      setTimeout(poll, 1000);
+    });
+  }
+
+  document.getElementById('vid').onclick = function(){
+    if (polling) { poll(); return; }
+    runStream();
   };
-  document.getElementById('vid').onclick = function(){ tries = 0; startStream(); };
-  startStream();
+  runStream();
 </script></body></html>
 )HTML";
 
@@ -404,6 +493,7 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
   const size_t len = fb->len;               // запомнить до возврата буфера
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, len);
   esp_camera_fb_return(fb);
   Serial.printf("jpg: otdan kadr %u bayt\n", (unsigned)len);
