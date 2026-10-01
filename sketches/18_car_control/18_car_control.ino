@@ -685,6 +685,21 @@ void setup() {
 void loop() {
   servoTick();
 
+  // Пульс раз в 5 секунд. Без него Serial Monitor, открытый ПОСЛЕ старта,
+  // выглядит пустым: всё остальное печатается один раз в setup(). Заодно
+  // видно сразу три вещи: секунды сбрасываются на 0 - плата уходит в
+  // перезагрузку по кругу; klientov 0 - телефон не подключился; pamyat
+  // тает со временем - где-то утечка.
+  static uint32_t beat = 0;
+  if (millis() - beat > 5000) {
+    beat = millis();
+    Serial.printf("zhiv: %lu sek, klientov %u, pamyat %u, kamera %s\n",
+                  (unsigned long)(millis() / 1000),
+                  (unsigned)WiFi.softAPgetStationNum(),
+                  (unsigned)ESP.getFreeHeap(),
+                  g_camOk ? "OK" : "NET");
+  }
+
   // Failsafe: пульт отвалился - всё стоп.
   static bool stopped = false;
   if (millis() - g_lastCmd > 2000) {
