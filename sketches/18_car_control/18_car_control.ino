@@ -288,12 +288,15 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 </div>
 
 <script>
-  // Команды: один короткий запрос, дубли не отправляем.
-  var last = '';
+  // Команды идут на порт 81 - там свой поток, и они не ждут, пока
+  // доедет кадр. Дубли не шлём.
+  var CMD = 'http://' + location.hostname + ':81/a?c=';
+  var last = '', quietUntil = 0;
   function cmd(c){
     if (c === last) return;
     last = c;
-    fetch('/a?c=' + c).catch(function(){});
+    quietUntil = Date.now() + 120;   // дать команде эфир, кадр подождёт
+    fetch(CMD + c).catch(function(){});
   }
 
   function bind(b){
@@ -344,6 +347,11 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   // Очередь кадров не копится, поэтому видно всегда самое свежее.
   var cam = document.getElementById('cam'), n = 0;
   function frame(){
+    // Только что нажали кнопку - пропускаем момент, чтобы команда ушла
+    // первой. Кадром позже можно пожертвовать, задержкой управления нет.
+    var wait = quietUntil - Date.now();
+    if (wait > 0) { setTimeout(frame, wait); return; }
+
     var img = new Image();
     img.onload  = function(){ cam.src = img.src; frame(); };
     img.onerror = function(){ setTimeout(frame, 500); };
@@ -353,7 +361,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 </script></body></html>
 )HTML";
 
-static httpd_handle_t server = NULL;
+static httpd_handle_t server = NULL;     // страница и кадры
+static httpd_handle_t cmdsrv = NULL;     // только команды, свой поток
 
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
@@ -387,15 +396,34 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
   // Сколько ушло на отправку кадра - честная мера того, как плох эфир.
   // Долго - жмём сильнее, стало быстро - возвращаем качество. Правим не
   // чаще двух раз в секунду, иначе картинка будет "дышать".
-  static int g_q = CAM_QUALITY;
+  static int  g_q = CAM_QUALITY;
+  static bool g_small = false;          // true = ушли на мелкий кадр
   static uint32_t lastAdj = 0;
   if (millis() - lastAdj > 500) {
+    sensor_t *sn = esp_camera_sensor_get();
     int q = g_q;
-    if      (sendMs > 150 && q < CAM_QUALITY_MIN) q += 2;
-    else if (sendMs <  60 && q > CAM_QUALITY)     q -= 1;
+
+    if (sendMs > 150) {
+      // Сначала жмём сильнее. Когда жать уже некуда - уменьшаем кадр.
+      if (q < CAM_QUALITY_MIN) q += 2;
+      else if (!g_small && sn) {
+        g_small = true;
+        sn->set_framesize(sn, FRAMESIZE_QQVGA);
+        Serial.println("video: efir ploh, ushli na QQVGA");
+      }
+    } else if (sendMs < 60) {
+      // Эфир освободился: сначала вернуть размер, потом качество.
+      if (g_small && sn) {
+        g_small = false;
+        sn->set_framesize(sn, CAM_FRAME_SIZE);
+        Serial.println("video: efir svoboden, vernuli razmer");
+      } else if (q > CAM_QUALITY) {
+        q -= 1;
+      }
+    }
+
     if (q != g_q) {
       g_q = q;
-      sensor_t *sn = esp_camera_sensor_get();
       if (sn) sn->set_quality(sn, g_q);
     }
     lastAdj = millis();
@@ -549,22 +577,41 @@ void setup() {
 
   // Один сервер: страница, команды и кадры. Раньше стрим занимал свой
   // сервер целиком, теперь кадр - обычный короткий запрос.
+  // Два сервера, и это принципиально. У esp_http_server один рабочий
+  // поток на сервер: пока он отдаёт кадр, следующий запрос ждёт. Когда
+  // команды жили на том же сервере, каждое нажатие ждало конца кадра -
+  // на плохой связи это сотни миллисекунд, и управление "вязло".
+  // Теперь команды на своём порту со своим потоком и не ждут никого.
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.max_uri_handlers = 3;
-  cfg.max_open_sockets = 4;
+  cfg.server_port      = 80;
+  cfg.ctrl_port        = 32768;
+  cfg.max_uri_handlers = 2;
+  cfg.max_open_sockets = 3;
   cfg.lru_purge_enable = true;
   cfg.stack_size       = 8192;
 
   httpd_uri_t page = { "/",    HTTP_GET, index_handler, NULL };
-  httpd_uri_t act  = { "/a",   HTTP_GET, cmd_handler,   NULL };
   httpd_uri_t jpg  = { "/jpg", HTTP_GET, jpg_handler,   NULL };
 
   if (httpd_start(&server, &cfg) == ESP_OK) {
     httpd_register_uri_handler(server, &page);
-    httpd_register_uri_handler(server, &act);
     httpd_register_uri_handler(server, &jpg);
   } else {
-    Serial.println("server FAILED");
+    Serial.println("server 80 FAILED");
+  }
+
+  httpd_config_t ccfg = HTTPD_DEFAULT_CONFIG();
+  ccfg.server_port      = 81;
+  ccfg.ctrl_port        = 32769;
+  ccfg.max_uri_handlers = 1;
+  ccfg.max_open_sockets = 3;
+  ccfg.lru_purge_enable = true;
+
+  httpd_uri_t act = { "/a", HTTP_GET, cmd_handler, NULL };
+  if (httpd_start(&cmdsrv, &ccfg) == ESP_OK) {
+    httpd_register_uri_handler(cmdsrv, &act);
+  } else {
+    Serial.println("server 81 FAILED");
   }
   g_lastCmd = millis();
 }
