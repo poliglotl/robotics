@@ -36,21 +36,27 @@
 // пачка кадров". Поэтому канал выбираем сами, по замеру эфира.
 #define AUTO_CHANNEL 1       // 0 = взять AP_CHAN как есть
 #define AP_CHAN      1       // запасной канал, если AUTO_CHANNEL 0
-#define WIDE_CHANNEL 1       // 1 = HT40, двойная ширина канала = вдвое быстрее
+// HT40 (двойная ширина) быстрее в пустом эфире и ХУЖЕ в забитом: ловит
+// вдвое больше помех и уходит в переотправки. Дома было 1, в школе из-за
+// этого были замирания. Держим 0; дома можно вернуть 1.
+#define WIDE_CHANNEL 0
 
 // ----------------------------------------------------------------- камера
 #define CAM_VFLIP    0       // картинка вверх ногами -> 1
-#define CAM_HMIRROR  0       // картинка зеркальная -> 1
+#define CAM_HMIRROR  1       // 0 = выключить зеркало (лево-право наоборот)
 
-// Размер и сжатие. Крутить это ИМЕЕТ СМЫСЛ ТОЛЬКО ПОСЛЕ того, как в логе
-// видно нормальные кадр/сек: если эфир забит, мельчить кадр бесполезно.
+// Размер и стартовое сжатие. Дальше сжатие подстраивается само: если
+// кадры уходят медленно, прошивка жмёт сильнее, пока не станет плавно,
+// и возвращает качество, когда эфир освободился. Поэтому в школе картинка
+// должна мылиться, а не вставать колом.
 //   FRAMESIZE_VGA    640x480 - как в заводской прошивке Keyestudio
 //   FRAMESIZE_QVGA   320x240 - вдвое легче, сейчас стоит это
 //   FRAMESIZE_QQVGA  160x120 - для гонок по коридору, смотреть не на что
 // Качество: МЕНЬШЕ число = лучше картинка и тяжелее кадр. 10 - хорошо,
 // 12-14 - компромисс, 18+ - мыло.
 #define CAM_FRAME_SIZE FRAMESIZE_QVGA
-#define CAM_QUALITY   12
+#define CAM_QUALITY   12     // лучшее качество, от которого пляшем
+#define CAM_QUALITY_MIN 28   // худшее, до которого можно опуститься
 
 // ------------------------------------------------------------------ серво
 // 0 = серво не трогаем совсем. Одно серво дохлое, второе воет, пока не
@@ -372,8 +378,28 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   const size_t fb_len = fb->len;
+
+  const uint32_t t0 = millis();
   esp_err_t r = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  const uint32_t sendMs = millis() - t0;
   esp_camera_fb_return(fb);                 // возвращаем всегда
+
+  // Сколько ушло на отправку кадра - честная мера того, как плох эфир.
+  // Долго - жмём сильнее, стало быстро - возвращаем качество. Правим не
+  // чаще двух раз в секунду, иначе картинка будет "дышать".
+  static int g_q = CAM_QUALITY;
+  static uint32_t lastAdj = 0;
+  if (millis() - lastAdj > 500) {
+    int q = g_q;
+    if      (sendMs > 150 && q < CAM_QUALITY_MIN) q += 2;
+    else if (sendMs <  60 && q > CAM_QUALITY)     q -= 1;
+    if (q != g_q) {
+      g_q = q;
+      sensor_t *sn = esp_camera_sensor_get();
+      if (sn) sn->set_quality(sn, g_q);
+    }
+    lastAdj = millis();
+  }
 
   // Кадров в секунду и уровень сигнала телефона. Если fps низкий, а
   // сигнал слабый - виноват эфир. Если сигнал сильный, а fps низкий -
@@ -385,9 +411,9 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
     if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) {
       rssi = sta.sta[0].rssi;
     }
-    Serial.printf("video: %lu kadr/sek, %u bayt, signal %d dBm\n",
+    Serial.printf("video: %lu kadr/sek, %u bayt, kachestvo %d, signal %d dBm\n",
                   (unsigned long)(frames * 1000UL / (millis() - at)),
-                  (unsigned)fb_len, rssi);
+                  (unsigned)fb_len, g_q, rssi);
     frames = 0;
     at = millis();
   }
@@ -407,7 +433,7 @@ static int pickQuietestChannel() {
   long score[12] = {0};
   for (int i = 0; i < n; i++) {
     int ch = WiFi.channel(i);
-    if (ch < 1 || ch > 11) continue;
+    if (ch < 1 || ch > 13) continue;
     long w = WiFi.RSSI(i) + 100;          // -90 dBm -> 10, -30 dBm -> 70
     if (w < 1) w = 1;
     w = w * w;                            // ближний сосед мешает намного сильнее
@@ -419,10 +445,14 @@ static int pickQuietestChannel() {
   }
   WiFi.scanDelete();
 
-  int best = 1;
-  for (int c = 1; c <= 11; c++) if (score[c] < score[best]) best = c;
-  Serial.printf("wifi: setey %d, vybran kanal %d (shum %ld, na 1-m %ld)\n",
-                n, best, score[best], score[1]);
+  // Выбираем только из 1, 6 и 11. Они единственные не перекрываются друг
+  // с другом; встать, скажем, на 4-й - значит ловить помеху и с 1-го, и
+  // с 6-го сразу. Дома это сходило с рук, в школе нет.
+  const int cand[3] = {1, 6, 11};
+  int best = cand[0];
+  for (int i = 1; i < 3; i++) if (score[cand[i]] < score[best]) best = cand[i];
+  Serial.printf("wifi: setey %d, kanal %d (shum 1:%ld 6:%ld 11:%ld)\n",
+                n, best, score[1], score[6], score[11]);
   return best;
 }
 #endif
